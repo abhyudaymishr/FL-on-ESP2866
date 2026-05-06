@@ -1,0 +1,166 @@
+Metadata-Version: 2.4
+Name: pifl-vis
+Version: 1.0.0
+Summary: Physics-Informed Federated Learning Python Visualization Server
+Author-email: PIFL Authors <authors@example.com>
+Classifier: Programming Language :: Python :: 3
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Operating System :: OS Independent
+Requires-Python: >=3.8
+Description-Content-Type: text/markdown
+
+# Physics-Informed Federated Learning on ESP8266
+
+This repository contains a minimal viable firmware implementation of a physics-informed federated thermal node for ESP8266.
+
+## What the MVP does
+
+- Reads a local temperature signal.
+- Maintains a 2D finite-difference state using four logical neighbors.
+- Predicts the next temperature with:
+  - diffusion term `alpha * Laplacian(T)`
+  - learnable correction `w1*T + w2*T^2 + b`
+- Updates `w1`, `w2`, and `b` from one-step prediction error.
+- Broadcasts:
+  - local temperature packets for PDE coupling
+  - model packets for federated learning
+- Aggregates peer models with Laplacian-magnitude weighting on the designated aggregator node.
+
+## Project layout
+
+- `platformio.ini`: PlatformIO configuration for `nodemcuv2`.
+- `include/config.h`: node identity, WiFi, timing, topology, and hyperparameters.
+- `include/protocol.h` + `src/protocol.cpp`: binary packet codec using fixed-point payloads.
+- `include/discretization.h` + `src/discretization.cpp`: Phase 1 finite-difference Laplacian and explicit Euler time stepping.
+- `include/node_model.h` + `src/node_model.cpp`: Phase 2 quadratic node model, hybrid prediction, and SGD update.
+- `include/node_state.h` + `src/node_state.cpp`: physics, learning, neighbor cache, and FedAvg logic.
+- `include/sensor.h` + `src/sensor.cpp`: synthetic or analog temperature source.
+- `src/main.cpp`: ESP8266 runtime loop.
+- `visualization/server.py`: live UDP FL dashboard for node temperatures, local loss, rounds, and global convergence.
+- `ppt/generator.py`: self-contained PowerPoint deck generator for the project overview.
+
+## Configuration
+
+Edit [`include/config.h`](/Users/abhyudaymishra/Downloads/FL on ESP8266/include/config.h) before flashing:
+
+- Set `kNodeId` to `0` for automatic chip-based IDs or assign unique IDs manually.
+- Set `kAggregatorNodeId` to a fixed node ID, or leave it `0` to elect the lowest online node automatically.
+- Fill `kNeighborIds` with the logical north/south/east/west node IDs.
+- Set `kWifiSsid` and `kWifiPassword`.
+- Choose `SensorMode::Synthetic` for dry runs or `SensorMode::AnalogLinear` for a simple analog sensor.
+
+With the default config, the node runs standalone with synthetic temperature input and no physical neighbors.
+
+## Real-time multi-device mode
+
+Multiple ESP8266 boards can now connect in real time on the same WiFi network.
+
+- Each node broadcasts discovery heartbeats, temperature, and model updates over UDP.
+- If `kNodeId` is `0`, each board derives its own node ID from the ESP8266 chip ID.
+- If `kNeighborIds` are left as `0`, the runtime can auto-fill the four stencil slots from live peers.
+- If `kAggregatorNodeId` is `0`, the node with the lowest active ID becomes the aggregation broadcaster.
+
+Recommended setup:
+
+1. Flash the same firmware to multiple ESP8266 boards.
+2. Put all boards on the same WiFi SSID and password.
+3. Leave `kNodeId = 0` for automatic unique IDs.
+4. Keep `kNeighborIds` at `0` for discovery-based operation, or assign explicit north/south/east/west IDs for a fixed topology.
+5. Open the serial monitor on each board and verify `node=<id>` and `peers=<count>` increase as boards come online.
+
+## Phase 1 and 2 implementation
+
+Phase 1 now lives in the discretization module:
+
+- finite-difference Laplacian on the four-neighbor stencil
+- explicit Euler time stepping for the diffusion PDE
+
+Phase 2 now lives in the node-model module:
+
+- quadratic correction term `w1*T + w2*T^2 + b`
+- hybrid physics-learning prediction
+- manual SGD update from one-step prediction error
+
+The runtime keeps these terms visible through `lap`, `diff`, `corr`, and `pred` in the serial log.
+
+## Visualisation module
+
+The repository now includes a live dashboard that listens to the same UDP packets emitted by the nodes and renders the federated learning state in real time.
+
+The dashboard shows:
+
+- live FL participants and their latest temperatures
+- per-node `w1`, `w2`, `b`
+- local aggregation weights
+- local FL round and loss
+- latest global aggregate
+- local loss history
+- global model convergence history
+
+Start it from the project root:
+
+```bash
+python3 visualization/server.py --http-port 8080 --udp-port 4210
+```
+
+Then open [http://127.0.0.1:8080](http://127.0.0.1:8080).
+
+Optional layout labels can be supplied by copying `visualization/layout.sample.json` to `visualization/layout.json` and editing the node names.
+
+When multiple boards are online on the same WiFi network, the dashboard becomes the main FL output surface for the whole cluster.
+
+## Simulation run test
+
+The repository includes an integration test that simulates a small packet exchange and verifies the dashboard reflects the run end to end.
+
+Run it from the project root:
+
+```bash
+python3 -m unittest tests/test_simulation_run.py
+```
+
+## PPT module
+
+The repository includes a pure-Python PPT generator that exports a project overview deck as a real `.pptx` file without `python-pptx`.
+
+Run it from the project root:
+
+```bash
+python3 -m ppt.generator --output artifacts/pifl_overview.pptx
+```
+
+The generated deck summarizes the mathematical model, firmware architecture, protocol design, tooling, and run commands.
+
+## Packet format
+
+All packets begin with:
+
+```text
+| NodeID (1B) | Type (1B) | Payload |
+```
+
+Packet types:
+
+- `0x01`: temperature packet, payload = temperature in centi-degrees C.
+- `0x02`: model update packet, payload = `w1`, `w2`, `b`, aggregation weight, local FL round, and local loss in fixed-point.
+- `0x03`: global aggregation packet, payload = aggregated `w1`, `w2`, `b`, global FL round, and global loss in fixed-point.
+- `0x04`: discovery packet, payload = node role flags and protocol version.
+
+## Main control loop
+
+Each sample step performs:
+
+1. Read current temperature.
+2. Compare the reading to the previous one-step prediction.
+3. Update `w1`, `w2`, `b` with manual SGD.
+4. Recompute Laplacian from the latest neighbor cache.
+5. Predict the next temperature.
+6. Broadcast temperature every sample.
+7. Broadcast the local model, aggregation weight, round, and loss periodically.
+8. Broadcast the aggregated global model, round, and global loss periodically on the aggregator node.
+
+## Notes
+
+- The transport is UDP broadcast over WiFi, not MQTT or HTTP.
+- Missing neighbors fall back to the local temperature, equivalent to a zero-flux boundary.
+- The sensor layer is intentionally lightweight. For DS18B20 or other sensors, replace `readTemperatureC()` in [`src/sensor.cpp`](/Users/abhyudaymishra/Downloads/FL on ESP8266/src/sensor.cpp).

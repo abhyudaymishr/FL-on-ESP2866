@@ -1,0 +1,2 @@
+[console_scripts]
+pifl-dashboard = pifl_vis.server:main

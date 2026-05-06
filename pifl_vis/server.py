@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import socket
+import struct
 import threading
 import time
 from dataclasses import dataclass, field
@@ -11,10 +12,6 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
-TEMPERATURE_SCALE = 100.0
-PARAMETER_SCALE = 1024.0
-WEIGHT_SCALE = 256.0
-LOSS_SCALE = 256.0
 TEMPERATURE_PACKET = 0x01
 MODEL_PACKET = 0x02
 AGGREGATION_PACKET = 0x03
@@ -604,13 +601,11 @@ class NodeTelemetry:
     model_history: list[dict[str, float | int]] = field(default_factory=list)
 
 
-def read_int16_le(buffer: bytes, offset: int) -> int:
-    return int.from_bytes(buffer[offset:offset + 2], "little", signed=True)
-
+def read_float32_le(buffer: bytes, offset: int) -> float:
+    return struct.unpack("<f", buffer[offset:offset+4])[0]
 
 def read_uint16_le(buffer: bytes, offset: int) -> int:
     return int.from_bytes(buffer[offset:offset + 2], "little", signed=False)
-
 
 def append_history(history: list[dict[str, float | int]], point: dict[str, float | int]) -> None:
     point_round = int(point.get("round", 0))
@@ -623,24 +618,23 @@ def append_history(history: list[dict[str, float | int]], point: dict[str, float
     if len(history) > HISTORY_LIMIT:
         del history[:-HISTORY_LIMIT]
 
-
 def decode_packet(packet: bytes) -> dict[str, Any] | None:
     if len(packet) < 2:
         return None
     node_id = packet[0]
     packet_type = packet[1]
-    if packet_type == TEMPERATURE_PACKET and len(packet) == 4:
-        temperature_c = read_int16_le(packet, 2) / TEMPERATURE_SCALE
+    if packet_type == TEMPERATURE_PACKET and len(packet) == 6:
+        temperature_c = read_float32_le(packet, 2)
         return {"kind": "temperature", "node_id": node_id, "temperature_c": temperature_c}
-    if packet_type == MODEL_PACKET and len(packet) in (10, 14):
+    if packet_type == MODEL_PACKET and len(packet) == 24:
         model = ModelParameters(
-            w1=read_int16_le(packet, 2) / PARAMETER_SCALE,
-            w2=read_int16_le(packet, 4) / PARAMETER_SCALE,
-            b=read_int16_le(packet, 6) / PARAMETER_SCALE,
+            w1=read_float32_le(packet, 2),
+            w2=read_float32_le(packet, 6),
+            b=read_float32_le(packet, 10),
         )
-        weight = read_uint16_le(packet, 8) / WEIGHT_SCALE
-        round_num = read_uint16_le(packet, 10) if len(packet) >= 12 else 0
-        loss = read_uint16_le(packet, 12) / LOSS_SCALE if len(packet) == 14 else None
+        weight = read_float32_le(packet, 14)
+        round_num = read_uint16_le(packet, 18)
+        loss = read_float32_le(packet, 20)
         return {
             "kind": "model",
             "node_id": node_id,
@@ -649,14 +643,14 @@ def decode_packet(packet: bytes) -> dict[str, Any] | None:
             "round": round_num,
             "loss": loss,
         }
-    if packet_type == AGGREGATION_PACKET and len(packet) in (8, 12):
+    if packet_type == AGGREGATION_PACKET and len(packet) == 20:
         model = ModelParameters(
-            w1=read_int16_le(packet, 2) / PARAMETER_SCALE,
-            w2=read_int16_le(packet, 4) / PARAMETER_SCALE,
-            b=read_int16_le(packet, 6) / PARAMETER_SCALE,
+            w1=read_float32_le(packet, 2),
+            w2=read_float32_le(packet, 6),
+            b=read_float32_le(packet, 10),
         )
-        round_num = read_uint16_le(packet, 8) if len(packet) >= 10 else 0
-        loss = read_uint16_le(packet, 10) / LOSS_SCALE if len(packet) == 12 else None
+        round_num = read_uint16_le(packet, 14)
+        loss = read_float32_le(packet, 16)
         return {
             "kind": "aggregation",
             "node_id": node_id,
@@ -919,7 +913,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--udp-port", type=int, default=4210)
     parser.add_argument("--http-host", default="127.0.0.1")
     parser.add_argument("--http-port", type=int, default=8080)
-    parser.add_argument("--layout", type=Path, default=Path("visualization/layout.json"))
+    parser.add_argument("--layout", type=Path, default=Path("pifl_vis/layout.sample.json"))
     return parser.parse_args()
 
 
