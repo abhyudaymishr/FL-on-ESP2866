@@ -1,18 +1,20 @@
 #include <Arduino.h>
 #include <ESP8266WiFi.h>
-#include <WiFiUdp.h>
+#include <WiFiManager.h>
 
 #include "config.h"
 #include "node_state.h"
 #include "protocol.h"
 #include "sensor.h"
+#include "transport.h"
 
 namespace {
 
 using namespace pifl;
 
-WiFiUDP gUdp;
 NodeState gNodeState;
+TemperatureSensor* gSensor = nullptr;
+Transport* gTransport = nullptr;
 
 uint8_t resolveLocalNodeId() {
   if (kNodeId != 0) {
@@ -50,26 +52,15 @@ void ensureWiFiConnected(const uint32_t nowMs) {
   }
 
   gNodeState.lastWifiRetryMs = nowMs;
-  WiFi.disconnect();
-  WiFi.mode(WIFI_STA);
-  WiFi.setAutoReconnect(true);
-  WiFi.persistent(false);
-  WiFi.begin(kWifiSsid, kWifiPassword);
-  Serial.println("Attempting WiFi reconnect...");
+  Serial.println("WiFi dropped, attempting reconnect...");
+  WiFi.reconnect();
 }
 
 bool sendPacket(const uint8_t* buffer, const size_t length) {
-  if (length == 0 || WiFi.status() != WL_CONNECTED) {
-    return false;
+  if (gTransport) {
+    return gTransport->sendPacket(buffer, length);
   }
-
-  if (!gUdp.beginPacket(kBroadcastIp, kProtocolPort)) {
-    return false;
-  }
-
-  const size_t written = gUdp.write(buffer, length);
-  const bool ok = gUdp.endPacket();
-  return written == length && ok;
+  return false;
 }
 
 void broadcastTemperature() {
@@ -82,9 +73,13 @@ void broadcastTemperature() {
 void broadcastModel() {
   uint8_t buffer[kModelPacketSize];
   const float weight = computeAggregationWeight(gNodeState.lastLaplacian);
-  const size_t length =
-      encodeModelPacket(gNodeState.localNodeId, gNodeState.model, weight, buffer, sizeof(buffer));
-  sendPacket(buffer, length);
+  const uint16_t nextRound = static_cast<uint16_t>(gNodeState.localModelRound + 1);
+  const size_t length = encodeModelPacket(gNodeState.localNodeId, gNodeState.model, weight,
+                                          gNodeState.lastLocalLoss, nextRound, buffer,
+                                          sizeof(buffer));
+  if (sendPacket(buffer, length)) {
+    gNodeState.localModelRound = nextRound;
+  }
 }
 
 void broadcastAggregation() {
@@ -94,11 +89,12 @@ void broadcastAggregation() {
   }
 
   uint8_t buffer[kAggregationPacketSize];
-  const size_t length =
-      encodeAggregationPacket(gNodeState.localNodeId, packet.model, buffer, sizeof(buffer));
+  const size_t length = encodeAggregationPacket(gNodeState.localNodeId, packet.model, packet.loss,
+                                                packet.round, buffer, sizeof(buffer));
   if (sendPacket(buffer, length)) {
     applyGlobalModel(gNodeState, packet);
-    Serial.println("Broadcast global aggregated model.");
+    Serial.printf("Broadcast global aggregated model. round=%u loss=%.4f\n", packet.round,
+                  packet.loss);
     logModel("Global model", packet.model);
   }
 }
@@ -160,44 +156,36 @@ void handleDiscoveryPacket(const uint8_t* buffer, const size_t length, const uin
   registerLivePeer(gNodeState, packet, nowMs);
 }
 
-void processInboundPackets(const uint32_t nowMs) {
-  int packetSize = gUdp.parsePacket();
-  while (packetSize > 0) {
-    uint8_t buffer[kMaxPacketSize];
-    const int bytesRead = gUdp.read(buffer, sizeof(buffer));
-
-    if (bytesRead >= static_cast<int>(kPacketHeaderSize)) {
-      PacketType packetType;
-      uint8_t sourceNodeId = 0;
-      if (getPacketType(buffer, static_cast<size_t>(bytesRead), packetType, sourceNodeId) &&
-          sourceNodeId != gNodeState.localNodeId) {
-        switch (packetType) {
-          case PacketType::Temperature:
-            handleTemperaturePacket(buffer, static_cast<size_t>(bytesRead), nowMs);
-            break;
-          case PacketType::ModelUpdate:
-            handleModelPacket(buffer, static_cast<size_t>(bytesRead), nowMs);
-            break;
-          case PacketType::GlobalAggregation:
-            handleAggregationPacket(buffer, static_cast<size_t>(bytesRead));
-            break;
-          case PacketType::Discovery:
-            handleDiscoveryPacket(buffer, static_cast<size_t>(bytesRead), nowMs);
-            break;
-        }
+void handleIncomingPacket(const uint8_t* buffer, size_t length, uint32_t nowMs) {
+  if (length >= kPacketHeaderSize) {
+    PacketType packetType;
+    uint8_t sourceNodeId = 0;
+    if (getPacketType(buffer, length, packetType, sourceNodeId) &&
+        sourceNodeId != gNodeState.localNodeId) {
+      switch (packetType) {
+        case PacketType::Temperature:
+          handleTemperaturePacket(buffer, length, nowMs);
+          break;
+        case PacketType::ModelUpdate:
+          handleModelPacket(buffer, length, nowMs);
+          break;
+        case PacketType::GlobalAggregation:
+          handleAggregationPacket(buffer, length);
+          break;
+        case PacketType::Discovery:
+          handleDiscoveryPacket(buffer, length, nowMs);
+          break;
       }
     }
-
-    packetSize = gUdp.parsePacket();
   }
 }
 
-void performSampleStep(const uint32_t nowMs) {
-  const float measuredTemperatureC = readTemperatureC(gNodeState.localNodeId, nowMs);
+void performSampleStep(const uint32_t nowMs, const float dtSeconds) {
+  const float measuredTemperatureC = gSensor->readTemperatureC(gNodeState.localNodeId, nowMs);
   const float previousPredictionC = gNodeState.pendingPredictionC;
   const bool hadPrediction = gNodeState.hasPendingPrediction;
 
-  applyMeasurement(gNodeState, measuredTemperatureC);
+  applyMeasurement(gNodeState, measuredTemperatureC, dtSeconds);
 
   Serial.printf("node=%u peers=%u T=%.2fC lap=%.4f diff=%.4f corr=%.4f pred=%.2fC",
                 gNodeState.localNodeId, static_cast<unsigned>(countOnlinePeers(gNodeState)),
@@ -205,7 +193,8 @@ void performSampleStep(const uint32_t nowMs) {
                 gNodeState.lastCorrectionTerm, gNodeState.pendingPredictionC);
   if (hadPrediction) {
     const float error = measuredTemperatureC - previousPredictionC;
-    Serial.printf(" error=%.4f sgd=%.4f", error, gNodeState.lastPredictionError);
+    Serial.printf(" error=%.4f sgd=%.4f loss=%.4f", error, gNodeState.lastPredictionError,
+                  gNodeState.lastLocalLoss);
   }
   Serial.println();
 
@@ -219,6 +208,8 @@ void performSampleStep(const uint32_t nowMs) {
   if (nowMs - gNodeState.lastModelSyncMs >= kModelSyncPeriodMs) {
     broadcastModel();
     gNodeState.lastModelSyncMs = nowMs;
+    Serial.printf("FL local round=%u loss=%.4f weight=%.4f\n", gNodeState.localModelRound,
+                  gNodeState.lastLocalLoss, computeAggregationWeight(gNodeState.lastLaplacian));
     logModel("Model sync", gNodeState.model);
   }
 
@@ -230,27 +221,12 @@ void performSampleStep(const uint32_t nowMs) {
 }
 
 void setupWiFi() {
-  WiFi.mode(WIFI_STA);
-  WiFi.setAutoReconnect(true);
-  WiFi.persistent(false);
-  WiFi.begin(kWifiSsid, kWifiPassword);
+  WiFiManager wifiManager;
+  wifiManager.autoConnect("FL-Node-AP");
 
-  Serial.printf("Joining WiFi SSID '%s'\n", kWifiSsid);
-  const uint32_t startMs = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - startMs < 8000) {
-    delay(250);
-    Serial.print(".");
-  }
   Serial.println();
-
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.print("WiFi connected, IP=");
-    Serial.println(WiFi.localIP());
-  } else {
-    Serial.println("WiFi not connected yet. Firmware will keep retrying.");
-  }
-
-  gUdp.begin(kProtocolPort);
+  Serial.print("WiFi connected, IP=");
+  Serial.println(WiFi.localIP());
 }
 
 }
@@ -264,6 +240,14 @@ void setup() {
   pifl::initializeNodeState(gNodeState, resolveLocalNodeId());
   Serial.printf("Local node id=%u\n", gNodeState.localNodeId);
   setupWiFi();
+
+  gSensor = pifl::createSensor();
+  gSensor->setup();
+
+  gTransport = pifl::createTransport();
+  gTransport->setPacketHandler(handleIncomingPacket);
+  gTransport->begin();
+
   broadcastDiscovery();
   gNodeState.lastDiscoveryMs = millis();
 }
@@ -273,11 +257,19 @@ void loop() {
 
   ensureWiFiConnected(nowMs);
   pifl::expireStaleData(gNodeState, nowMs);
-  processInboundPackets(nowMs);
+  if (gTransport) {
+    gTransport->loop(nowMs);
+  }
 
   if (nowMs - gNodeState.lastSampleMs >= pifl::kSamplePeriodMs) {
+    float dtSeconds = (gNodeState.lastSampleMs == 0) ? 
+        (static_cast<float>(pifl::kSamplePeriodMs) / 1000.0f) : 
+        (static_cast<float>(nowMs - gNodeState.lastSampleMs) / 1000.0f);
+    if (dtSeconds < 0.001f) {
+      dtSeconds = 0.001f;
+    }
     gNodeState.lastSampleMs = nowMs;
-    performSampleStep(nowMs);
+    performSampleStep(nowMs, dtSeconds);
   }
 
   yield();

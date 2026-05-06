@@ -23,10 +23,10 @@ float evaluateQuadraticCorrection(const ModelParameters& model, float temperatur
 Phase2Prediction predictPhase2NodeStep(const FiniteDifferenceStencil& stencil, float alpha,
                                        const ModelParameters& model, float gridSpacing,
                                        float dtSeconds);
-Phase2TrainingUpdate computePhase2SgdUpdate(float measuredTempC, float predictedTempC,
-                                            float inputTempC, float learningRate,
-                                            float dtSeconds);
-void applyPhase2SgdUpdate(ModelParameters& model, const Phase2TrainingUpdate& update);
+Phase2TrainingUpdate computePhase2Gradients(float measuredTempC, float predictedTempC,
+                                            float inputTempC);
+void applyPhase2AdamUpdate(ModelParameters& model, ModelParameters& m, ModelParameters& v,
+                           uint32_t step, const Phase2TrainingUpdate& grads, float learningRate);
 void clampPhase2Model(ModelParameters& model, float maxAbsW1, float maxAbsW2, float maxAbsB);
 
 }

@@ -25,7 +25,7 @@ This repository contains a minimal viable firmware implementation of a physics-i
 - `include/node_state.h` + `src/node_state.cpp`: physics, learning, neighbor cache, and FedAvg logic.
 - `include/sensor.h` + `src/sensor.cpp`: synthetic or analog temperature source.
 - `src/main.cpp`: ESP8266 runtime loop.
-- `visualization/server.py`: live UDP dashboard for node temperatures and model parameters.
+- `visualization/server.py`: live UDP FL dashboard for node temperatures, local loss, rounds, and global convergence.
 - `ppt/generator.py`: self-contained PowerPoint deck generator for the project overview.
 
 ## Configuration
@@ -74,7 +74,17 @@ The runtime keeps these terms visible through `lap`, `diff`, `corr`, and `pred` 
 
 ## Visualisation module
 
-The repository now includes a live dashboard that listens to the same UDP packets emitted by the nodes and renders a browser view of the thermal field and federated model state.
+The repository now includes a live dashboard that listens to the same UDP packets emitted by the nodes and renders the federated learning state in real time.
+
+The dashboard shows:
+
+- live FL participants and their latest temperatures
+- per-node `w1`, `w2`, `b`
+- local aggregation weights
+- local FL round and loss
+- latest global aggregate
+- local loss history
+- global model convergence history
 
 Start it from the project root:
 
@@ -85,6 +95,8 @@ python3 visualization/server.py --http-port 8080 --udp-port 4210
 Then open [http://127.0.0.1:8080](http://127.0.0.1:8080).
 
 Optional layout labels can be supplied by copying `visualization/layout.sample.json` to `visualization/layout.json` and editing the node names.
+
+When multiple boards are online on the same WiFi network, the dashboard becomes the main FL output surface for the whole cluster.
 
 ## Simulation run test
 
@@ -119,8 +131,9 @@ All packets begin with:
 Packet types:
 
 - `0x01`: temperature packet, payload = temperature in centi-degrees C.
-- `0x02`: model update packet, payload = `w1`, `w2`, `b`, and aggregation weight in fixed-point.
-- `0x03`: global aggregation packet, payload = aggregated `w1`, `w2`, `b` in fixed-point.
+- `0x02`: model update packet, payload = `w1`, `w2`, `b`, aggregation weight, local FL round, and local loss in fixed-point.
+- `0x03`: global aggregation packet, payload = aggregated `w1`, `w2`, `b`, global FL round, and global loss in fixed-point.
+- `0x04`: discovery packet, payload = node role flags and protocol version.
 
 ## Main control loop
 
@@ -132,8 +145,8 @@ Each sample step performs:
 4. Recompute Laplacian from the latest neighbor cache.
 5. Predict the next temperature.
 6. Broadcast temperature every sample.
-7. Broadcast model periodically.
-8. Broadcast aggregated model periodically on the aggregator node.
+7. Broadcast the local model, aggregation weight, round, and loss periodically.
+8. Broadcast the aggregated global model, round, and global loss periodically on the aggregator node.
 
 ## Notes
 

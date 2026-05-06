@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>PIFL Interactive Dashboard</title>
+  <meta name="description" content="Physics-Informed Federated Learning Telemetry Dashboard">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+  <script src="/socket.io/socket.io.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body>
+  <div class="dashboard-container">
+    <header class="glass-header">
+      <div class="logo">
+        <div class="pulse-ring"></div>
+        <h1>PIFL Network</h1>
+      </div>
+      <div class="status-bar">
+        <span id="connection-status" class="status-badge disconnected">Backend Disconnected</span>
+        <span id="active-nodes-badge" class="status-badge">0 Active Nodes</span>
+      </div>
+    </header>
+
+    <main class="dashboard-grid">
+      <section class="charts-section glass-panel">
+        <div class="chart-header">
+          <h2>Network Temperature Convergence</h2>
+        </div>
+        <div class="chart-container">
+          <canvas id="tempChart"></canvas>
+        </div>
+      </section>
+
+      <section class="charts-section glass-panel">
+        <div class="chart-header">
+          <h2>Federated Loss Trajectory</h2>
+        </div>
+        <div class="chart-container">
+          <canvas id="lossChart"></canvas>
+        </div>
+      </section>
+      
+      <section class="nodes-section">
+        <h2 class="section-title">Node Telemetry</h2>
+        <div class="nodes-grid" id="nodes-container">
+          <!-- Node cards will be injected here dynamically -->
+        </div>
+      </section>
+    </main>
+  </div>
+  
+  <template id="node-card-template">
+    <div class="node-card glass-panel" data-node-id="">
+      <div class="node-header">
+        <h3 class="node-title">Node <span class="node-id-display">--</span></h3>
+        <span class="role-badge">Peer</span>
+      </div>
+      <div class="node-stats">
+        <div class="stat-row">
+          <span class="stat-label">Temperature</span>
+          <span class="stat-value temp-value">-- °C</span>
+        </div>
+        <div class="stat-row">
+          <span class="stat-label">Round</span>
+          <span class="stat-value round-value">--</span>
+        </div>
+        <div class="stat-row">
+          <span class="stat-label">Loss</span>
+          <span class="stat-value loss-value">--</span>
+        </div>
+        <div class="stat-row">
+          <span class="stat-label">Model Weights</span>
+          <div class="weights-box">
+            <span>w1: <span class="w1-value">--</span></span>
+            <span>w2: <span class="w2-value">--</span></span>
+            <span>b: <span class="b-value">--</span></span>
+          </div>
+        </div>
+        <div class="stat-row source-row">
+          <span class="stat-label">Last Source</span>
+          <span class="stat-value source-value">--</span>
+        </div>
+      </div>
+      <div class="node-footer">
+        <span class="last-seen">Last seen: Just now</span>
+      </div>
+    </div>
+  </template>
+
+  <script src="app.js"></script>
+</body>
+</html>

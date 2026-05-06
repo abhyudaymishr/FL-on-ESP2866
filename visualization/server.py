@@ -14,29 +14,37 @@ from typing import Any
 TEMPERATURE_SCALE = 100.0
 PARAMETER_SCALE = 1024.0
 WEIGHT_SCALE = 256.0
+LOSS_SCALE = 256.0
 TEMPERATURE_PACKET = 0x01
 MODEL_PACKET = 0x02
 AGGREGATION_PACKET = 0x03
+DISCOVERY_PACKET = 0x04
+PROTOCOL_VERSION = 0x01
+ROLE_FLAG_AGGREGATOR_ELIGIBLE = 0x01
+ROLE_FLAG_AUTO_NEIGHBOR = 0x02
+HISTORY_LIMIT = 40
 
 HTML = """<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>PIFL Visualisation</title>
+  <title>PIFL Federated Learning Dashboard</title>
   <style>
     :root {
       color-scheme: dark;
-      --bg: #07111c;
-      --panel: rgba(10, 24, 39, 0.92);
-      --panel-strong: rgba(18, 40, 61, 0.97);
-      --line: rgba(146, 184, 211, 0.24);
+      --bg-a: #07111c;
+      --bg-b: #03070c;
+      --panel: rgba(11, 24, 40, 0.92);
+      --panel-strong: rgba(17, 37, 58, 0.96);
+      --line: rgba(147, 184, 211, 0.18);
       --text: #eef6ff;
       --muted: #9bb4c7;
       --accent: #79d4ff;
       --accent-2: #ffc66b;
-      --good: #8bf1c9;
-      --bad: #ff8f8f;
+      --accent-3: #8bf1c9;
+      --accent-4: #ff8f8f;
+      --accent-5: #a8b8ff;
       --shadow: 0 20px 60px rgba(0, 0, 0, 0.35);
       font-family: "Avenir Next", "Segoe UI", sans-serif;
     }
@@ -47,62 +55,62 @@ HTML = """<!doctype html>
       color: var(--text);
       background:
         radial-gradient(circle at top left, rgba(121, 212, 255, 0.18), transparent 30%),
-        radial-gradient(circle at top right, rgba(255, 198, 107, 0.14), transparent 32%),
-        linear-gradient(180deg, #08121d 0%, #03070c 100%);
+        radial-gradient(circle at top right, rgba(255, 198, 107, 0.12), transparent 34%),
+        linear-gradient(180deg, var(--bg-a) 0%, var(--bg-b) 100%);
     }
     .shell {
-      max-width: 1320px;
+      max-width: 1380px;
       margin: 0 auto;
-      padding: 32px 20px 48px;
+      padding: 28px 18px 44px;
     }
     .hero {
       display: grid;
       gap: 18px;
-      grid-template-columns: 1.5fr 1fr;
+      grid-template-columns: 1.4fr 1fr;
       align-items: end;
-      margin-bottom: 22px;
+      margin-bottom: 18px;
     }
     .title {
-      font-size: clamp(2rem, 4vw, 3.4rem);
-      line-height: 0.95;
-      letter-spacing: -0.05em;
       margin: 0;
+      font-size: clamp(2.1rem, 4vw, 3.6rem);
+      line-height: 0.94;
+      letter-spacing: -0.05em;
     }
     .subtitle {
-      margin: 10px 0 0;
+      margin: 12px 0 0;
       color: var(--muted);
-      max-width: 60ch;
+      max-width: 68ch;
       line-height: 1.5;
     }
     .panel {
       background: var(--panel);
       border: 1px solid var(--line);
-      border-radius: 22px;
+      border-radius: 24px;
       box-shadow: var(--shadow);
       backdrop-filter: blur(18px);
     }
     .stats {
       display: grid;
       gap: 12px;
-      grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+      grid-template-columns: repeat(auto-fit, minmax(135px, 1fr));
       padding: 18px;
     }
     .stat {
       padding: 14px 16px;
       border-radius: 18px;
       background: rgba(255, 255, 255, 0.03);
-      border: 1px solid rgba(255, 255, 255, 0.04);
+      border: 1px solid rgba(255, 255, 255, 0.05);
     }
     .stat-label {
       display: block;
-      color: var(--muted);
-      font-size: 0.8rem;
-      text-transform: uppercase;
-      letter-spacing: 0.08em;
       margin-bottom: 10px;
+      color: var(--muted);
+      font-size: 0.78rem;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
     }
     .stat-value {
-      font-size: 1.6rem;
+      font-size: 1.55rem;
       font-weight: 700;
       letter-spacing: -0.04em;
     }
@@ -111,77 +119,67 @@ HTML = """<!doctype html>
       gap: 18px;
       grid-template-columns: 1.5fr 1fr;
       align-items: start;
+      margin-bottom: 18px;
+    }
+    .section-title {
+      margin: 0 0 16px;
+      color: var(--muted);
+      font-size: 0.9rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
     }
     .canvas {
       padding: 18px;
     }
-    .section-title {
-      margin: 0 0 16px;
-      font-size: 0.95rem;
-      color: var(--muted);
-      text-transform: uppercase;
-      letter-spacing: 0.08em;
-    }
     .node-grid {
       display: grid;
       gap: 14px;
-      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      grid-template-columns: repeat(auto-fit, minmax(225px, 1fr));
       min-height: 220px;
     }
     .node-card {
       position: relative;
       overflow: hidden;
-      padding: 16px;
-      min-height: 180px;
-      border-radius: 20px;
-      border: 1px solid rgba(255, 255, 255, 0.08);
-      background: var(--panel-strong);
       display: grid;
       gap: 12px;
       align-content: start;
-      transform: translateY(0);
-      transition: transform 180ms ease, border-color 180ms ease;
-    }
-    .node-card:hover {
-      transform: translateY(-2px);
-      border-color: rgba(121, 212, 255, 0.4);
+      min-height: 205px;
+      padding: 16px;
+      border-radius: 22px;
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      background: var(--panel-strong);
     }
     .node-card::after {
       content: "";
       position: absolute;
-      inset: auto -10% -35% auto;
-      width: 120px;
-      height: 120px;
+      width: 140px;
+      height: 140px;
+      right: -26px;
+      bottom: -46px;
       border-radius: 999px;
-      background: rgba(255, 255, 255, 0.08);
+      background: rgba(255, 255, 255, 0.07);
       filter: blur(10px);
     }
     .node-top {
       display: flex;
       justify-content: space-between;
+      gap: 10px;
       align-items: baseline;
-      gap: 8px;
     }
     .node-id {
-      font-size: 1.2rem;
+      font-size: 1.15rem;
       font-weight: 700;
       letter-spacing: -0.03em;
     }
     .node-age {
       color: var(--muted);
-      font-size: 0.8rem;
+      font-size: 0.78rem;
     }
     .temperature {
-      font-size: 2.4rem;
-      letter-spacing: -0.06em;
+      font-size: 2.1rem;
       font-weight: 800;
-      line-height: 0.9;
-    }
-    .node-meta {
-      display: grid;
-      gap: 6px;
-      color: var(--muted);
-      font-size: 0.9rem;
+      letter-spacing: -0.06em;
+      line-height: 0.95;
     }
     .chips {
       display: flex;
@@ -189,26 +187,31 @@ HTML = """<!doctype html>
       gap: 8px;
     }
     .chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
       padding: 6px 10px;
       border-radius: 999px;
       background: rgba(255, 255, 255, 0.06);
       border: 1px solid rgba(255, 255, 255, 0.08);
       font-size: 0.78rem;
-      color: var(--text);
     }
     .mono {
       font-family: "SFMono-Regular", "Menlo", monospace;
-      font-size: 0.84rem;
+      font-size: 0.83rem;
     }
-    .model-grid {
+    .node-meta {
       display: grid;
-      gap: 12px;
+      gap: 6px;
+      color: var(--muted);
+      font-size: 0.88rem;
     }
     .model-card {
       padding: 16px;
       border-radius: 20px;
       background: rgba(255, 255, 255, 0.04);
       border: 1px solid rgba(255, 255, 255, 0.08);
+      margin-bottom: 12px;
     }
     .model-card h3 {
       margin: 0 0 12px;
@@ -227,24 +230,66 @@ HTML = """<!doctype html>
     .metric-label {
       color: var(--muted);
     }
-    .empty {
-      padding: 28px;
-      border-radius: 20px;
-      border: 1px dashed rgba(255, 255, 255, 0.16);
+    .charts {
+      display: grid;
+      gap: 18px;
+      grid-template-columns: 1fr 1fr;
+    }
+    .chart-shell {
+      padding: 18px;
+    }
+    .chart-frame {
+      min-height: 260px;
+      border-radius: 18px;
+      border: 1px solid rgba(255, 255, 255, 0.06);
+      background: rgba(255, 255, 255, 0.03);
+      padding: 12px;
+    }
+    .legend {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 10px;
+    }
+    .legend-item {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
       color: var(--muted);
+      font-size: 0.8rem;
+    }
+    .swatch {
+      width: 10px;
+      height: 10px;
+      border-radius: 999px;
+      display: inline-block;
+    }
+    .empty {
+      min-height: 190px;
+      display: grid;
+      place-items: center;
       text-align: center;
+      color: var(--muted);
+      border: 1px dashed rgba(255, 255, 255, 0.16);
+      border-radius: 18px;
+      padding: 28px;
     }
     .footer {
-      margin-top: 18px;
-      color: var(--muted);
-      font-size: 0.85rem;
+      margin-top: 16px;
       display: flex;
       justify-content: space-between;
       gap: 10px;
       flex-wrap: wrap;
+      color: var(--muted);
+      font-size: 0.84rem;
     }
-    @media (max-width: 960px) {
-      .hero, .section {
+    svg text {
+      fill: var(--muted);
+      font-family: "SFMono-Regular", "Menlo", monospace;
+      font-size: 12px;
+    }
+    @media (max-width: 1040px) {
+      .hero, .section, .charts {
         grid-template-columns: 1fr;
       }
     }
@@ -254,21 +299,34 @@ HTML = """<!doctype html>
   <div class="shell">
     <section class="hero">
       <div>
-        <h1 class="title">Physics-Informed<br>Federated Thermal Grid</h1>
-        <p class="subtitle">Live telemetry view for ESP8266 nodes broadcasting temperature, local model parameters, and global aggregation packets over the custom binary protocol.</p>
+        <h1 class="title">Physics-Informed<br>Federated Learning Dashboard</h1>
+        <p class="subtitle">Live FL output for ESP8266 nodes: participant state, local losses, federated rounds, and global model convergence from the custom binary protocol.</p>
       </div>
       <div class="panel stats" id="summary"></div>
     </section>
+
     <section class="section">
       <div class="panel canvas">
-        <h2 class="section-title">Node Field</h2>
+        <h2 class="section-title">FL Participants</h2>
         <div id="grid" class="node-grid"></div>
       </div>
       <div class="panel canvas">
-        <h2 class="section-title">Global Model</h2>
-        <div id="global" class="model-grid"></div>
+        <h2 class="section-title">Global FL State</h2>
+        <div id="global"></div>
       </div>
     </section>
+
+    <section class="charts">
+      <div class="panel chart-shell">
+        <h2 class="section-title">Local Loss History</h2>
+        <div id="loss-chart" class="chart-frame"></div>
+      </div>
+      <div class="panel chart-shell">
+        <h2 class="section-title">Global Convergence</h2>
+        <div id="convergence-chart" class="chart-frame"></div>
+      </div>
+    </section>
+
     <div class="footer">
       <span id="status">Waiting for packets...</span>
       <span>Refresh interval: 1 s</span>
@@ -278,7 +336,11 @@ HTML = """<!doctype html>
     const summary = document.getElementById("summary");
     const grid = document.getElementById("grid");
     const globalPane = document.getElementById("global");
+    const lossChart = document.getElementById("loss-chart");
+    const convergenceChart = document.getElementById("convergence-chart");
     const status = document.getElementById("status");
+
+    const palette = ["#79D4FF", "#FFC66B", "#8BF1C9", "#FF8F8F", "#A8B8FF", "#9BD6C1", "#F5B3D3", "#D5F26F"];
 
     function fmt(value, digits = 3) {
       return Number.isFinite(value) ? value.toFixed(digits) : "n/a";
@@ -308,7 +370,9 @@ HTML = """<!doctype html>
     function renderSummary(data) {
       const items = [
         ["Nodes", data.node_count],
-        ["Temp Packets", data.packet_counters.temperature],
+        ["Participants", data.participant_count],
+        ["Global Round", data.global_round || 0],
+        ["Avg Loss", fmt(data.average_local_loss, 4)],
         ["Model Packets", data.packet_counters.model],
         ["Global Packets", data.packet_counters.aggregation]
       ];
@@ -330,7 +394,7 @@ HTML = """<!doctype html>
       const min = temperatures.length ? Math.min(...temperatures) : 0;
       const max = temperatures.length ? Math.max(...temperatures) : 1;
 
-      grid.innerHTML = nodes.map((node) => `
+      grid.innerHTML = nodes.map((node, index) => `
         <article class="node-card" style="background:
           linear-gradient(180deg, ${heatColor(node.temperature_c, min, max)}, rgba(8, 19, 31, 0.96)),
           rgba(18, 40, 61, 0.97);">
@@ -340,13 +404,16 @@ HTML = """<!doctype html>
           </div>
           <div class="temperature">${fmt(node.temperature_c, 2)}<span class="mono"> C</span></div>
           <div class="chips">
+            <span class="chip">round ${node.round || 0}</span>
+            <span class="chip">loss ${fmt(node.loss, 4)}</span>
             <span class="chip">weight ${fmt(node.aggregation_weight, 3)}</span>
-            <span class="chip">${node.address || "unknown source"}</span>
+            ${(node.role_flags & 1) ? `<span class="chip"><span class="swatch" style="background:${palette[index % palette.length]}"></span>agg-capable</span>` : ""}
           </div>
           <div class="node-meta mono">
             <div>w1 ${fmt(node.model.w1)}</div>
             <div>w2 ${fmt(node.model.w2)}</div>
             <div>b ${fmt(node.model.b)}</div>
+            <div>${node.address || "unknown source"}</div>
           </div>
         </article>
       `).join("");
@@ -361,13 +428,134 @@ HTML = """<!doctype html>
       globalPane.innerHTML = `
         <section class="model-card">
           <h3>Latest Aggregate</h3>
-          <div class="metric-row"><span class="metric-label">Sender</span><span class="mono">${data.global_sender}</span></div>
+          <div class="metric-row"><span class="metric-label">Aggregator</span><span class="mono">${data.global_sender}</span></div>
+          <div class="metric-row"><span class="metric-label">Global Round</span><span class="mono">${data.global_round}</span></div>
+          <div class="metric-row"><span class="metric-label">Global Loss</span><span class="mono">${fmt(data.global_loss, 4)}</span></div>
           <div class="metric-row"><span class="metric-label">w1</span><span class="mono">${fmt(data.global_model.w1)}</span></div>
           <div class="metric-row"><span class="metric-label">w2</span><span class="mono">${fmt(data.global_model.w2)}</span></div>
           <div class="metric-row"><span class="metric-label">b</span><span class="mono">${fmt(data.global_model.b)}</span></div>
           <div class="metric-row"><span class="metric-label">Updated</span><span class="mono">${ageLabel(data.global_age_s)}</span></div>
         </section>
       `;
+    }
+
+    function buildChart(seriesList, options = {}) {
+      const width = options.width || 560;
+      const height = options.height || 230;
+      const margin = { top: 16, right: 18, bottom: 28, left: 48 };
+      const innerWidth = width - margin.left - margin.right;
+      const innerHeight = height - margin.top - margin.bottom;
+      const activeSeries = seriesList.filter((series) => series.points && series.points.length);
+
+      if (!activeSeries.length) {
+        return `<div class="empty">Waiting for enough FL telemetry to render this chart.</div>`;
+      }
+
+      const allPoints = activeSeries.flatMap((series) => series.points);
+      const xValues = allPoints.map((point) => point.x);
+      const yValues = allPoints.map((point) => point.y);
+      const xMin = Math.min(...xValues);
+      let xMax = Math.max(...xValues);
+      let yMin = Math.min(...yValues);
+      let yMax = Math.max(...yValues);
+
+      if (options.floorZero) {
+        yMin = Math.min(0, yMin);
+      }
+      if (xMin === xMax) {
+        xMax = xMin + 1;
+      }
+      if (yMin === yMax) {
+        yMin -= 1;
+        yMax += 1;
+      }
+
+      const yPad = (yMax - yMin) * 0.12;
+      yMin -= yPad;
+      yMax += yPad;
+
+      const scaleX = (value) => margin.left + ((value - xMin) / (xMax - xMin)) * innerWidth;
+      const scaleY = (value) => margin.top + innerHeight - ((value - yMin) / (yMax - yMin)) * innerHeight;
+
+      const gridLines = [];
+      for (let i = 0; i < 5; i += 1) {
+        const ratio = i / 4;
+        const y = margin.top + ratio * innerHeight;
+        const value = yMax - ratio * (yMax - yMin);
+        gridLines.push(`
+          <line x1="${margin.left}" y1="${y}" x2="${width - margin.right}" y2="${y}" stroke="rgba(255,255,255,0.08)" stroke-width="1" />
+          <text x="${margin.left - 8}" y="${y + 4}" text-anchor="end">${fmt(value, 3)}</text>
+        `);
+      }
+
+      const xTicks = [];
+      for (let i = 0; i < 5; i += 1) {
+        const ratio = i / 4;
+        const value = xMin + ratio * (xMax - xMin);
+        const x = scaleX(value);
+        xTicks.push(`
+          <line x1="${x}" y1="${margin.top + innerHeight}" x2="${x}" y2="${margin.top + innerHeight + 6}" stroke="rgba(255,255,255,0.14)" stroke-width="1" />
+          <text x="${x}" y="${height - 6}" text-anchor="middle">${fmt(value, 0)}</text>
+        `);
+      }
+
+      const paths = activeSeries.map((series) => {
+        const points = series.points.map((point) => `${scaleX(point.x)},${scaleY(point.y)}`).join(" ");
+        return `<polyline fill="none" stroke="${series.color}" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" points="${points}" />`;
+      }).join("");
+
+      const legend = activeSeries.map((series) => `
+        <span class="legend-item">
+          <span class="swatch" style="background:${series.color}"></span>
+          ${series.label}
+        </span>
+      `).join("");
+
+      return `
+        <svg viewBox="0 0 ${width} ${height}" width="100%" height="230" role="img" aria-label="${options.title || "chart"}">
+          ${gridLines.join("")}
+          <line x1="${margin.left}" y1="${margin.top + innerHeight}" x2="${width - margin.right}" y2="${margin.top + innerHeight}" stroke="rgba(255,255,255,0.18)" stroke-width="1.2" />
+          ${xTicks.join("")}
+          ${paths}
+        </svg>
+        <div class="legend">${legend}</div>
+      `;
+    }
+
+    function renderLossChart(data) {
+      const series = data.nodes
+        .filter((node) => node.loss_history.length)
+        .map((node, index) => ({
+          label: node.label,
+          color: palette[index % palette.length],
+          points: node.loss_history.map((point) => ({ x: point.round, y: point.loss }))
+        }));
+      lossChart.innerHTML = buildChart(series, { title: "Local loss history", floorZero: true });
+    }
+
+    function renderConvergenceChart(data) {
+      if (!data.global_history.length) {
+        convergenceChart.innerHTML = `<div class="empty">Waiting for global rounds to render convergence.</div>`;
+        return;
+      }
+      const series = [
+        {
+          label: "w1",
+          color: "#79D4FF",
+          points: data.global_history.map((point) => ({ x: point.round, y: point.model.w1 }))
+        },
+        {
+          label: "w2",
+          color: "#FFC66B",
+          points: data.global_history.map((point) => ({ x: point.round, y: point.model.w2 }))
+        },
+        {
+          label: "b",
+          color: "#8BF1C9",
+          points: data.global_history.map((point) => ({ x: point.round, y: point.model.b }))
+        }
+      ];
+      convergenceChart.innerHTML = buildChart(series, { title: "Global convergence" });
     }
 
     async function refresh() {
@@ -377,7 +565,9 @@ HTML = """<!doctype html>
         renderSummary(data);
         renderNodes(data.nodes);
         renderGlobal(data);
-        status.textContent = `Listening on UDP ${data.udp_port}, dashboard on HTTP ${data.http_port}`;
+        renderLossChart(data);
+        renderConvergenceChart(data);
+        status.textContent = `Listening on UDP ${data.udp_port}, dashboard on HTTP ${data.http_port}, participants ${data.participant_count}, global round ${data.global_round || 0}`;
       } catch (error) {
         status.textContent = `Dashboard error: ${error.message}`;
       }
@@ -406,7 +596,12 @@ class NodeTelemetry:
     temperature_c: float | None = None
     model: ModelParameters = field(default_factory=ModelParameters)
     aggregation_weight: float = 0.0
+    loss: float | None = None
+    round: int = 0
+    role_flags: int = 0
     last_seen: float = 0.0
+    loss_history: list[dict[str, float | int]] = field(default_factory=list)
+    model_history: list[dict[str, float | int]] = field(default_factory=list)
 
 
 def read_int16_le(buffer: bytes, offset: int) -> int:
@@ -417,6 +612,18 @@ def read_uint16_le(buffer: bytes, offset: int) -> int:
     return int.from_bytes(buffer[offset:offset + 2], "little", signed=False)
 
 
+def append_history(history: list[dict[str, float | int]], point: dict[str, float | int]) -> None:
+    point_round = int(point.get("round", 0))
+    for index, existing in enumerate(history):
+        if int(existing.get("round", -1)) == point_round and point_round != 0:
+            history[index] = point
+            break
+    else:
+        history.append(point)
+    if len(history) > HISTORY_LIMIT:
+        del history[:-HISTORY_LIMIT]
+
+
 def decode_packet(packet: bytes) -> dict[str, Any] | None:
     if len(packet) < 2:
         return None
@@ -425,21 +632,44 @@ def decode_packet(packet: bytes) -> dict[str, Any] | None:
     if packet_type == TEMPERATURE_PACKET and len(packet) == 4:
         temperature_c = read_int16_le(packet, 2) / TEMPERATURE_SCALE
         return {"kind": "temperature", "node_id": node_id, "temperature_c": temperature_c}
-    if packet_type == MODEL_PACKET and len(packet) == 10:
+    if packet_type == MODEL_PACKET and len(packet) in (10, 14):
         model = ModelParameters(
             w1=read_int16_le(packet, 2) / PARAMETER_SCALE,
             w2=read_int16_le(packet, 4) / PARAMETER_SCALE,
             b=read_int16_le(packet, 6) / PARAMETER_SCALE,
         )
         weight = read_uint16_le(packet, 8) / WEIGHT_SCALE
-        return {"kind": "model", "node_id": node_id, "model": model, "weight": weight}
-    if packet_type == AGGREGATION_PACKET and len(packet) == 8:
+        round_num = read_uint16_le(packet, 10) if len(packet) >= 12 else 0
+        loss = read_uint16_le(packet, 12) / LOSS_SCALE if len(packet) == 14 else None
+        return {
+            "kind": "model",
+            "node_id": node_id,
+            "model": model,
+            "weight": weight,
+            "round": round_num,
+            "loss": loss,
+        }
+    if packet_type == AGGREGATION_PACKET and len(packet) in (8, 12):
         model = ModelParameters(
             w1=read_int16_le(packet, 2) / PARAMETER_SCALE,
             w2=read_int16_le(packet, 4) / PARAMETER_SCALE,
             b=read_int16_le(packet, 6) / PARAMETER_SCALE,
         )
-        return {"kind": "aggregation", "node_id": node_id, "model": model}
+        round_num = read_uint16_le(packet, 8) if len(packet) >= 10 else 0
+        loss = read_uint16_le(packet, 10) / LOSS_SCALE if len(packet) == 12 else None
+        return {
+            "kind": "aggregation",
+            "node_id": node_id,
+            "model": model,
+            "round": round_num,
+            "loss": loss,
+        }
+    if packet_type == DISCOVERY_PACKET and len(packet) == 4 and packet[3] == PROTOCOL_VERSION:
+        return {
+            "kind": "discovery",
+            "node_id": node_id,
+            "role_flags": packet[2],
+        }
     return None
 
 
@@ -450,10 +680,13 @@ class DashboardState:
         self.layout = layout
         self.lock = threading.Lock()
         self.nodes: dict[int, NodeTelemetry] = {}
-        self.packet_counters = {"temperature": 0, "model": 0, "aggregation": 0}
+        self.packet_counters = {"temperature": 0, "model": 0, "aggregation": 0, "discovery": 0}
         self.global_model: ModelParameters | None = None
         self.global_sender: int | None = None
         self.global_seen: float = 0.0
+        self.global_round: int = 0
+        self.global_loss: float | None = None
+        self.global_history: list[dict[str, Any]] = []
 
     def get_or_create_node(self, node_id: int, address: str) -> NodeTelemetry:
         node = self.nodes.get(node_id)
@@ -466,6 +699,13 @@ class DashboardState:
             node.address = address
         return node
 
+    def update_discovery(self, node_id: int, role_flags: int, address: str) -> None:
+        with self.lock:
+            node = self.get_or_create_node(node_id, address)
+            node.role_flags = role_flags
+            node.last_seen = time.time()
+            self.packet_counters["discovery"] += 1
+
     def update_temperature(self, node_id: int, temperature_c: float, address: str) -> None:
         with self.lock:
             node = self.get_or_create_node(node_id, address)
@@ -473,28 +713,70 @@ class DashboardState:
             node.last_seen = time.time()
             self.packet_counters["temperature"] += 1
 
-    def update_model(self, node_id: int, model: ModelParameters, weight: float, address: str) -> None:
+    def update_model(
+        self,
+        node_id: int,
+        model: ModelParameters,
+        weight: float,
+        round_num: int,
+        loss: float | None,
+        address: str,
+    ) -> None:
         with self.lock:
             node = self.get_or_create_node(node_id, address)
             node.model = model
             node.aggregation_weight = weight
+            node.round = round_num
+            node.loss = loss
             node.last_seen = time.time()
+            if round_num > 0:
+                append_history(
+                    node.model_history,
+                    {"round": round_num, "w1": model.w1, "w2": model.w2, "b": model.b},
+                )
+                if loss is not None:
+                    append_history(node.loss_history, {"round": round_num, "loss": loss})
             self.packet_counters["model"] += 1
 
-    def update_global(self, node_id: int, model: ModelParameters, address: str) -> None:
+    def update_global(
+        self,
+        node_id: int,
+        model: ModelParameters,
+        round_num: int,
+        loss: float | None,
+        address: str,
+    ) -> None:
         with self.lock:
             node = self.get_or_create_node(node_id, address)
             node.last_seen = time.time()
             self.global_model = model
             self.global_sender = node_id
             self.global_seen = time.time()
+            self.global_round = round_num
+            self.global_loss = loss
+            if round_num > 0:
+                append_history(
+                    self.global_history,
+                    {
+                        "round": round_num,
+                        "loss": loss,
+                        "sender": node_id,
+                        "model": {"w1": model.w1, "w2": model.w2, "b": model.b},
+                    },
+                )
             self.packet_counters["aggregation"] += 1
 
     def snapshot(self) -> dict[str, Any]:
         with self.lock:
             now = time.time()
             nodes = []
+            losses = []
+            participants = 0
             for node in sorted(self.nodes.values(), key=lambda item: item.node_id):
+                if node.round > 0:
+                    participants += 1
+                if node.loss is not None:
+                    losses.append(node.loss)
                 nodes.append(
                     {
                         "node_id": node.node_id,
@@ -503,22 +785,32 @@ class DashboardState:
                         "temperature_c": node.temperature_c,
                         "aggregation_weight": node.aggregation_weight,
                         "age_s": now - node.last_seen if node.last_seen else None,
+                        "round": node.round,
+                        "loss": node.loss,
+                        "role_flags": node.role_flags,
                         "model": {
                             "w1": node.model.w1,
                             "w2": node.model.w2,
                             "b": node.model.b,
                         },
+                        "loss_history": list(node.loss_history),
+                        "model_history": list(node.model_history),
                     }
                 )
             payload: dict[str, Any] = {
                 "udp_port": self.udp_port,
                 "http_port": self.http_port,
                 "node_count": len(nodes),
+                "participant_count": participants,
+                "average_local_loss": (sum(losses) / len(losses)) if losses else None,
                 "nodes": nodes,
                 "packet_counters": dict(self.packet_counters),
                 "global_sender": self.global_sender,
                 "global_age_s": now - self.global_seen if self.global_seen else None,
+                "global_round": self.global_round,
+                "global_loss": self.global_loss,
                 "global_model": None,
+                "global_history": list(self.global_history),
             }
             if self.global_model is not None:
                 payload["global_model"] = {
@@ -564,12 +856,27 @@ def run_udp_listener(
             if decoded is None:
                 continue
             source = f"{address[0]}:{address[1]}"
-            if decoded["kind"] == "temperature":
+            if decoded["kind"] == "discovery":
+                state.update_discovery(decoded["node_id"], decoded["role_flags"], source)
+            elif decoded["kind"] == "temperature":
                 state.update_temperature(decoded["node_id"], decoded["temperature_c"], source)
             elif decoded["kind"] == "model":
-                state.update_model(decoded["node_id"], decoded["model"], decoded["weight"], source)
+                state.update_model(
+                    decoded["node_id"],
+                    decoded["model"],
+                    decoded["weight"],
+                    decoded["round"],
+                    decoded["loss"],
+                    source,
+                )
             else:
-                state.update_global(decoded["node_id"], decoded["model"], source)
+                state.update_global(
+                    decoded["node_id"],
+                    decoded["model"],
+                    decoded["round"],
+                    decoded["loss"],
+                    source,
+                )
     finally:
         sock.close()
 
@@ -607,7 +914,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Live visualisation dashboard for PIFL ESP8266 nodes")
+    parser = argparse.ArgumentParser(description="FL dashboard for PIFL ESP8266 nodes")
     parser.add_argument("--udp-host", default="0.0.0.0")
     parser.add_argument("--udp-port", type=int, default=4210)
     parser.add_argument("--http-host", default="127.0.0.1")

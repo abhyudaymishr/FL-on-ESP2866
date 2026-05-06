@@ -117,6 +117,10 @@ float resolvedNeighborTemperature(const NodeState& state, const NeighborIndex in
     return dynamicPeerTemperature(state, static_cast<size_t>(index));
   }
 
+  if (kBoundaryCondition == BoundaryCondition::AmbientDirichlet) {
+    return kAmbientTemperatureC;
+  }
+
   return state.currentTempC;
 }
 
@@ -156,9 +160,16 @@ void initializeNodeState(NodeState& state, const uint8_t localNodeId) {
   state.lastDiffusionTerm = 0.0f;
   state.lastCorrectionTerm = 0.0f;
   state.lastPredictionError = 0.0f;
+  state.lastLocalLoss = 0.0f;
+  state.lastGlobalLoss = 0.0f;
   state.alpha = kAlpha;
   state.model = {0.0f, 0.0f, 0.0f};
+  state.m = {0.0f, 0.0f, 0.0f};
+  state.v = {0.0f, 0.0f, 0.0f};
+  state.sgdStepCount = 0;
   state.hasPendingPrediction = false;
+  state.localModelRound = 0;
+  state.lastGlobalRound = 0;
   state.lastDiscoveryMs = 0;
   state.lastSampleMs = 0;
   state.lastModelSyncMs = 0;
@@ -185,6 +196,8 @@ void initializeNodeState(NodeState& state, const uint8_t localNodeId) {
     state.peerModels[index].nodeId = 0;
     state.peerModels[index].model = {0.0f, 0.0f, 0.0f};
     state.peerModels[index].weight = 0.0f;
+    state.peerModels[index].loss = 0.0f;
+    state.peerModels[index].round = 0;
     state.peerModels[index].lastSeenMs = 0;
     state.peerModels[index].valid = false;
   }
@@ -259,6 +272,8 @@ void registerPeerModel(NodeState& state, const ModelPacket& packet, const uint32
   state.peerModels[slot].nodeId = packet.nodeId;
   state.peerModels[slot].model = packet.model;
   state.peerModels[slot].weight = packet.weight;
+  state.peerModels[slot].loss = packet.loss;
+  state.peerModels[slot].round = packet.round;
   state.peerModels[slot].lastSeenMs = nowMs;
   state.peerModels[slot].valid = true;
 }
@@ -267,6 +282,8 @@ void applyGlobalModel(NodeState& state, const AggregationPacket& packet) {
   state.model.w1 = (1.0f - kGlobalBlend) * state.model.w1 + kGlobalBlend * packet.model.w1;
   state.model.w2 = (1.0f - kGlobalBlend) * state.model.w2 + kGlobalBlend * packet.model.w2;
   state.model.b = (1.0f - kGlobalBlend) * state.model.b + kGlobalBlend * packet.model.b;
+  state.lastGlobalRound = packet.round;
+  state.lastGlobalLoss = packet.loss;
   clampModel(state.model);
 }
 
@@ -283,22 +300,26 @@ float computeAggregationWeight(const float laplacian) {
   return magnitude > kMinimumAggregationWeight ? magnitude : kMinimumAggregationWeight;
 }
 
-float predictNextTemperature(const NodeState& state) {
+float predictNextTemperature(const NodeState& state, float dtSeconds) {
   return predictPhase2NodeStep(buildStencil(state), state.alpha, state.model, kGridSpacing,
-                               kDtSeconds)
+                               dtSeconds)
       .predictedTempC;
 }
 
-void applyMeasurement(NodeState& state, const float measuredTemperatureC) {
+void applyMeasurement(NodeState& state, const float measuredTemperatureC, const float dtSeconds) {
   if (state.hasPendingPrediction) {
-    const Phase2TrainingUpdate update =
-        computePhase2SgdUpdate(measuredTemperatureC, state.pendingPredictionC,
-                               state.lastPredictionInputC, kLearningRate, kDtSeconds);
-    state.lastPredictionError = update.error;
-    applyPhase2SgdUpdate(state.model, update);
-    clampModel(state.model);
+    const Phase2TrainingUpdate grads =
+        computePhase2Gradients(measuredTemperatureC, state.pendingPredictionC,
+                               state.lastPredictionInputC);
+    state.lastPredictionError = grads.error;
+    state.lastLocalLoss = grads.error * grads.error;
+    
+    state.sgdStepCount++;
+    applyPhase2AdamUpdate(state.model, state.m, state.v, state.sgdStepCount, grads, kLearningRate);
+    clampPhase2Model(state.model, 32.0f, 32.0f, 32.0f);
   } else {
     state.lastPredictionError = 0.0f;
+    state.lastLocalLoss = 0.0f;
   }
 
   state.currentTempC = measuredTemperatureC;
@@ -306,7 +327,7 @@ void applyMeasurement(NodeState& state, const float measuredTemperatureC) {
 
   const Phase2Prediction prediction =
       predictPhase2NodeStep(buildStencil(state), state.alpha, state.model, kGridSpacing,
-                            kDtSeconds);
+                            dtSeconds);
   state.lastLaplacian = prediction.laplacian;
   state.lastDiffusionTerm = prediction.diffusionTerm;
   state.lastCorrectionTerm = prediction.correctionTerm;
@@ -315,10 +336,12 @@ void applyMeasurement(NodeState& state, const float measuredTemperatureC) {
 }
 
 bool buildAggregatedModel(const NodeState& state, AggregationPacket& packet) {
-  float weightedW1 = state.model.w1 * computeAggregationWeight(state.lastLaplacian);
-  float weightedW2 = state.model.w2 * computeAggregationWeight(state.lastLaplacian);
-  float weightedB = state.model.b * computeAggregationWeight(state.lastLaplacian);
-  float totalWeight = computeAggregationWeight(state.lastLaplacian);
+  const float localWeight = computeAggregationWeight(state.lastLaplacian);
+  float weightedW1 = state.model.w1 * localWeight;
+  float weightedW2 = state.model.w2 * localWeight;
+  float weightedB = state.model.b * localWeight;
+  float weightedLoss = state.lastLocalLoss * localWeight;
+  float totalWeight = localWeight;
 
   for (size_t index = 0; index < kMaxFederatedPeers; ++index) {
     if (!state.peerModels[index].valid) {
@@ -331,6 +354,7 @@ bool buildAggregatedModel(const NodeState& state, AggregationPacket& packet) {
     weightedW1 += state.peerModels[index].model.w1 * peerWeight;
     weightedW2 += state.peerModels[index].model.w2 * peerWeight;
     weightedB += state.peerModels[index].model.b * peerWeight;
+    weightedLoss += state.peerModels[index].loss * peerWeight;
     totalWeight += peerWeight;
   }
 
@@ -342,6 +366,8 @@ bool buildAggregatedModel(const NodeState& state, AggregationPacket& packet) {
   packet.model.w1 = weightedW1 / totalWeight;
   packet.model.w2 = weightedW2 / totalWeight;
   packet.model.b = weightedB / totalWeight;
+  packet.round = state.lastGlobalRound + 1;
+  packet.loss = weightedLoss / totalWeight;
   return true;
 }
 

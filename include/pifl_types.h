@@ -29,6 +29,8 @@ struct PeerModelState {
   uint8_t nodeId;
   ModelParameters model;
   float weight;
+  float loss;
+  uint16_t round;
   uint32_t lastSeenMs;
   bool valid;
 };

@@ -28,28 +28,48 @@ def encode_unsigned(value: float, scale: float) -> bytes:
     return int(bounded).to_bytes(2, "little", signed=False)
 
 
+def discovery_packet(node_id: int, role_flags: int) -> bytes:
+    return bytes(
+        [node_id, server.DISCOVERY_PACKET, role_flags, server.PROTOCOL_VERSION]
+    )
+
+
 def temperature_packet(node_id: int, temperature_c: float) -> bytes:
     return bytes([node_id, server.TEMPERATURE_PACKET]) + encode_signed(
         temperature_c, server.TEMPERATURE_SCALE
     )
 
 
-def model_packet(node_id: int, w1: float, w2: float, b: float, weight: float) -> bytes:
+def model_packet(
+    node_id: int,
+    w1: float,
+    w2: float,
+    b: float,
+    weight: float,
+    round_num: int,
+    loss: float,
+) -> bytes:
     return (
         bytes([node_id, server.MODEL_PACKET])
         + encode_signed(w1, server.PARAMETER_SCALE)
         + encode_signed(w2, server.PARAMETER_SCALE)
         + encode_signed(b, server.PARAMETER_SCALE)
         + encode_unsigned(weight, server.WEIGHT_SCALE)
+        + int(round_num).to_bytes(2, "little", signed=False)
+        + encode_unsigned(loss, server.LOSS_SCALE)
     )
 
 
-def aggregation_packet(node_id: int, w1: float, w2: float, b: float) -> bytes:
+def aggregation_packet(
+    node_id: int, w1: float, w2: float, b: float, round_num: int, loss: float
+) -> bytes:
     return (
         bytes([node_id, server.AGGREGATION_PACKET])
         + encode_signed(w1, server.PARAMETER_SCALE)
         + encode_signed(w2, server.PARAMETER_SCALE)
         + encode_signed(b, server.PARAMETER_SCALE)
+        + int(round_num).to_bytes(2, "little", signed=False)
+        + encode_unsigned(loss, server.LOSS_SCALE)
     )
 
 
@@ -100,8 +120,11 @@ class SimulationRunTest(unittest.TestCase):
             if (
                 snapshot["node_count"] == expected_node_count
                 and snapshot["packet_counters"]["temperature"] >= 2
-                and snapshot["packet_counters"]["model"] >= 1
+                and snapshot["packet_counters"]["model"] >= 2
                 and snapshot["packet_counters"]["aggregation"] >= 1
+                and snapshot["packet_counters"]["discovery"] >= 2
+                and snapshot["participant_count"] >= expected_node_count
+                and snapshot["global_round"] >= 3
             ):
                 return snapshot
             time.sleep(0.05)
@@ -110,10 +133,28 @@ class SimulationRunTest(unittest.TestCase):
     def test_simulated_run_updates_dashboard_state(self) -> None:
         sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
+            sender.sendto(
+                discovery_packet(1, server.ROLE_FLAG_AGGREGATOR_ELIGIBLE),
+                ("127.0.0.1", self.udp_port),
+            )
             sender.sendto(temperature_packet(1, 26.25), ("127.0.0.1", self.udp_port))
-            sender.sendto(model_packet(1, 0.125, -0.03125, 0.5, 1.75), ("127.0.0.1", self.udp_port))
+            sender.sendto(
+                model_packet(1, 0.125, -0.03125, 0.5, 1.75, 2, 0.1875),
+                ("127.0.0.1", self.udp_port),
+            )
+            sender.sendto(
+                discovery_packet(2, server.ROLE_FLAG_AUTO_NEIGHBOR),
+                ("127.0.0.1", self.udp_port),
+            )
             sender.sendto(temperature_packet(2, 29.50), ("127.0.0.1", self.udp_port))
-            sender.sendto(aggregation_packet(1, 0.25, 0.0625, 1.0), ("127.0.0.1", self.udp_port))
+            sender.sendto(
+                model_packet(2, 0.0625, 0.015625, 0.25, 0.875, 2, 0.09375),
+                ("127.0.0.1", self.udp_port),
+            )
+            sender.sendto(
+                aggregation_packet(1, 0.25, 0.0625, 1.0, 3, 0.125),
+                ("127.0.0.1", self.udp_port),
+            )
         finally:
             sender.close()
 
@@ -124,10 +165,15 @@ class SimulationRunTest(unittest.TestCase):
 
         self.assertIn("Physics-Informed", root)
         self.assertEqual(snapshot["node_count"], 2)
+        self.assertEqual(snapshot["participant_count"], 2)
         self.assertEqual(snapshot["global_sender"], 1)
         self.assertEqual(snapshot["packet_counters"]["temperature"], 2)
-        self.assertEqual(snapshot["packet_counters"]["model"], 1)
+        self.assertEqual(snapshot["packet_counters"]["model"], 2)
         self.assertEqual(snapshot["packet_counters"]["aggregation"], 1)
+        self.assertEqual(snapshot["packet_counters"]["discovery"], 2)
+        self.assertEqual(snapshot["global_round"], 3)
+        self.assertAlmostEqual(snapshot["global_loss"], 0.125, places=3)
+        self.assertAlmostEqual(snapshot["average_local_loss"], 0.140625, places=3)
 
         nodes = {node["node_id"]: node for node in snapshot["nodes"]}
         self.assertEqual(nodes[1]["label"], "Alpha")
@@ -135,12 +181,29 @@ class SimulationRunTest(unittest.TestCase):
         self.assertAlmostEqual(nodes[1]["temperature_c"], 26.25, places=2)
         self.assertAlmostEqual(nodes[2]["temperature_c"], 29.50, places=2)
         self.assertAlmostEqual(nodes[1]["aggregation_weight"], 1.75, places=2)
+        self.assertAlmostEqual(nodes[2]["aggregation_weight"], 0.875, places=3)
+        self.assertEqual(nodes[1]["round"], 2)
+        self.assertEqual(nodes[2]["round"], 2)
+        self.assertAlmostEqual(nodes[1]["loss"], 0.1875, places=3)
+        self.assertAlmostEqual(nodes[2]["loss"], 0.09375, places=3)
+        self.assertEqual(nodes[1]["role_flags"], server.ROLE_FLAG_AGGREGATOR_ELIGIBLE)
+        self.assertEqual(nodes[2]["role_flags"], server.ROLE_FLAG_AUTO_NEIGHBOR)
         self.assertAlmostEqual(nodes[1]["model"]["w1"], 0.125, places=3)
         self.assertAlmostEqual(nodes[1]["model"]["w2"], -0.03125, places=3)
         self.assertAlmostEqual(nodes[1]["model"]["b"], 0.5, places=3)
+        self.assertAlmostEqual(nodes[2]["model"]["w1"], 0.0625, places=3)
+        self.assertAlmostEqual(nodes[2]["model"]["w2"], 0.015625, places=3)
+        self.assertAlmostEqual(nodes[2]["model"]["b"], 0.25, places=3)
+        self.assertEqual(len(nodes[1]["loss_history"]), 1)
+        self.assertEqual(len(nodes[2]["loss_history"]), 1)
+        self.assertEqual(nodes[1]["loss_history"][0]["round"], 2)
+        self.assertEqual(nodes[2]["loss_history"][0]["round"], 2)
         self.assertAlmostEqual(snapshot["global_model"]["w1"], 0.25, places=3)
         self.assertAlmostEqual(snapshot["global_model"]["w2"], 0.0625, places=3)
         self.assertAlmostEqual(snapshot["global_model"]["b"], 1.0, places=3)
+        self.assertEqual(len(snapshot["global_history"]), 1)
+        self.assertEqual(snapshot["global_history"][0]["round"], 3)
+        self.assertAlmostEqual(snapshot["global_history"][0]["loss"], 0.125, places=3)
 
 
 if __name__ == "__main__":
