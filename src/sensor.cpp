@@ -41,7 +41,7 @@ public:
     sensors.requestTemperatures();
     float temp = sensors.getTempCByIndex(0);
     if (temp == DEVICE_DISCONNECTED_C) {
-      return kInitialTemperatureC;
+      return NAN;
     }
     return temp;
   }

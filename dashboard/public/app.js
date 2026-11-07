@@ -64,8 +64,8 @@ const getOrCreateNodeCard = (nodeId) => {
       id: nodeId,
       temp: null,
       model: { w1: 0, w2: 0, b: 0 },
-      loss: 0,
-      round: 0,
+      loss: null,
+      round: null,
       lastSeen: Date.now(),
       source: 'Unknown'
     });
@@ -113,8 +113,8 @@ const updateNodeUI = (nodeId) => {
   if (!card) return;
 
   if (node.temp !== null) card.querySelector('.temp-value').textContent = `${node.temp.toFixed(2)} °C`;
-  if (node.round) card.querySelector('.round-value').textContent = node.round;
-  if (node.loss) card.querySelector('.loss-value').textContent = node.loss.toExponential(2);
+  if (node.round !== null) card.querySelector('.round-value').textContent = node.round;
+  if (Number.isFinite(node.loss)) card.querySelector('.loss-value').textContent = node.loss.toExponential(2);
   
   card.querySelector('.w1-value').textContent = node.model.w1.toFixed(4);
   card.querySelector('.w2-value').textContent = node.model.w2.toFixed(4);
@@ -163,20 +163,22 @@ socket.on('packet', (packet) => {
   if (type === 'Temperature') {
     node.temp = packet.temperatureC;
     updateCharts = true;
-  } else if (type === 'ModelUpdate' || type === 'GlobalAggregation') {
+  } else if (type === 'ModelUpdate') {
     node.model = packet.model;
     node.loss = packet.loss;
     node.round = packet.round;
-    if (type === 'GlobalAggregation') {
-      document.querySelector(`.node-card[data-node-id="${nodeId}"] .role-badge`).textContent = 'Aggregator';
-    }
     updateCharts = true;
+  } else if (type === 'GlobalAggregation') {
+    document.getElementById('aggregate-summary').textContent =
+      `Aggregate ${packet.round} · Leader ${nodeId} · Contributor training loss ${packet.meanContributorLoss.toExponential(3)} (not global validation loss)`;
+    document.querySelectorAll('.role-badge').forEach(badge => badge.textContent = 'Peer');
+    document.querySelector(`.node-card[data-node-id="${nodeId}"] .role-badge`).textContent = 'Aggregator';
   }
 
   updateNodeUI(nodeId);
 
   if (updateCharts) {
-    pushChartData(nodeId, node.temp, node.loss);
+    pushChartData(nodeId, type === 'Temperature' ? node.temp : null, type === 'ModelUpdate' ? node.loss : null);
   }
 });
 
@@ -199,7 +201,10 @@ setInterval(() => {
     const card = document.querySelector(`.node-card[data-node-id="${id}"]`);
     if (card) {
       const secondsAgo = Math.floor((now - node.lastSeen) / 1000);
-      card.querySelector('.last-seen').textContent = `Last seen: ${secondsAgo}s ago`;
+      card.querySelector('.last-seen').textContent = secondsAgo > 6 ? `Offline · ${secondsAgo}s ago` : `Last seen: ${secondsAgo}s ago`;
+      card.style.opacity = secondsAgo > 6 ? '0.5' : '1';
     }
   });
+  const active = [...nodes.values()].filter(node => now - node.lastSeen <= 6000).length;
+  document.getElementById('active-nodes-badge').textContent = `${active} Active Nodes`;
 }, 1000);

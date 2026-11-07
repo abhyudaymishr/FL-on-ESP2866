@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstdint>
+
 namespace pifl {
 
 struct FiniteDifferenceStencil {
@@ -8,6 +10,8 @@ struct FiniteDifferenceStencil {
   float southTempC;
   float eastTempC;
   float westTempC;
+  // N/S/E/W bits: missing zero-flux neighbors track the evolving center.
+  uint8_t zeroFluxMask = 0;
 };
 
 struct Phase1StepResult {

@@ -33,7 +33,7 @@ constexpr uint8_t kNeighborIds[NeighborCount] = {
     0,
 };
 
-constexpr size_t kMaxFederatedPeers = 8;
+constexpr size_t kMaxFederatedPeers = 12;
 constexpr size_t kMaxRealtimePeers = 12;
 
 constexpr TransportMode kTransportMode = TransportMode::UDP;
@@ -44,7 +44,12 @@ constexpr const char* kMqttBroker = "192.168.1.100";
 constexpr uint16_t kMqttPort = 1883;
 constexpr const char* kMqttTopic = "pifl/broadcast";
 
-constexpr const char* kNetworkSecret = "pifl_secret_key_123!";
+// Override with a build flag and matching dashboard environment variable.
+// The legacy FNV envelope is an integrity check, not an authentication scheme.
+#ifndef PIFL_NETWORK_SECRET
+#define PIFL_NETWORK_SECRET "pifl-development-only"
+#endif
+constexpr const char* kNetworkSecret = PIFL_NETWORK_SECRET;
 
 constexpr SensorMode kSensorMode = SensorMode::Synthetic;
 constexpr uint8_t kAnalogPin = A0;
@@ -53,6 +58,8 @@ constexpr float kAnalogOffset = 0.0f;
 constexpr uint8_t kDs18b20Pin = D2;
 
 constexpr float kInitialTemperatureC = 24.0f;
+constexpr float kMinTemperatureC = -55.0f;
+constexpr float kMaxTemperatureC = 125.0f;
 constexpr float kSyntheticAmplitudeC = 1.5f;
 constexpr float kSyntheticWavePeriodSeconds = 60.0f;
 constexpr float kSyntheticNodePhaseRadians = 0.45f;
@@ -74,8 +81,6 @@ constexpr uint32_t kRealtimePeerTimeoutMs = 6000;
 constexpr uint32_t kPeerModelTimeoutMs = 15000;
 constexpr uint32_t kWifiRetryPeriodMs = 5000;
 
-constexpr float kMinimumAggregationWeight = 0.05f;
-constexpr bool kAutoAssignNeighbors = true;
 
 constexpr bool kClampModelParameters = true;
 constexpr float kMaxAbsW1 = 2.0f;

@@ -1,6 +1,7 @@
 #include "transport.h"
 #include "config.h"
 #include "protocol.h"
+#include "packet_envelope.h"
 
 #include <ESP8266WiFi.h>
 #include <WiFiUdp.h>
@@ -9,59 +10,6 @@
 namespace pifl {
 
 namespace {
-
-uint32_t computeSignature(const uint8_t* buffer, size_t length, const char* secret) {
-  uint32_t hash = 2166136261u;
-  for (size_t i = 0; i < length; ++i) {
-    hash ^= buffer[i];
-    hash *= 16777619u;
-  }
-  for (size_t i = 0; secret[i] != '\0'; ++i) {
-    hash ^= secret[i];
-    hash *= 16777619u;
-  }
-  return hash;
-}
-
-void writeUInt32LE(uint8_t* buffer, uint32_t value) {
-  buffer[0] = static_cast<uint8_t>(value & 0xFF);
-  buffer[1] = static_cast<uint8_t>((value >> 8) & 0xFF);
-  buffer[2] = static_cast<uint8_t>((value >> 16) & 0xFF);
-  buffer[3] = static_cast<uint8_t>((value >> 24) & 0xFF);
-}
-
-uint32_t readUInt32LE(const uint8_t* buffer) {
-  return static_cast<uint32_t>(buffer[0]) |
-         (static_cast<uint32_t>(buffer[1]) << 8) |
-         (static_cast<uint32_t>(buffer[2]) << 16) |
-         (static_cast<uint32_t>(buffer[3]) << 24);
-}
-
-size_t signAndWrap(const uint8_t* input, size_t inputLength, uint8_t* output) {
-  for (size_t i = 0; i < inputLength; ++i) {
-    output[i] = input[i];
-  }
-  const uint32_t sig = computeSignature(input, inputLength, kNetworkSecret);
-  writeUInt32LE(&output[inputLength], sig);
-  return inputLength + 4;
-}
-
-bool verifyAndUnwrap(const uint8_t* input, size_t inputLength, uint8_t* output, size_t& outputLength) {
-  if (inputLength < 4) {
-    return false;
-  }
-  const size_t payloadLength = inputLength - 4;
-  const uint32_t expectedSig = computeSignature(input, payloadLength, kNetworkSecret);
-  const uint32_t actualSig = readUInt32LE(&input[payloadLength]);
-  if (expectedSig != actualSig) {
-    return false;
-  }
-  for (size_t i = 0; i < payloadLength; ++i) {
-    output[i] = input[i];
-  }
-  outputLength = payloadLength;
-  return true;
-}
 
 void mqttCallbackWrapper(char* topic, byte* payload, unsigned int length);
 
@@ -76,17 +24,22 @@ public:
 
   void loop(uint32_t nowMs) override {
     int packetSize = udp.parsePacket();
-    while (packetSize > 0) {
+    for (unsigned handled = 0; packetSize > 0 && handled < 8; ++handled) {
+      if (packetSize > static_cast<int>(kMaxPacketSize + kPacketChecksumSize)) {
+        while (udp.available()) udp.read();
+        packetSize = udp.parsePacket();
+        continue;
+      }
       uint8_t rxBuffer[kMaxPacketSize + 4];
       const int bytesRead = udp.read(rxBuffer, sizeof(rxBuffer));
 
-      if (bytesRead > 4 && packetHandler) {
+      if (bytesRead == packetSize && bytesRead > 4 && packetHandler) {
         uint8_t unwrapped[kMaxPacketSize];
         size_t unwrappedLength = 0;
-        if (verifyAndUnwrap(rxBuffer, static_cast<size_t>(bytesRead), unwrapped, unwrappedLength)) {
+        if (unwrapPacket(rxBuffer, static_cast<size_t>(bytesRead), unwrapped, sizeof(unwrapped), unwrappedLength, kNetworkSecret)) {
           packetHandler(unwrapped, unwrappedLength, nowMs);
         } else {
-          Serial.println("Warning: Invalid UDP packet signature rejected.");
+          Serial.println("Warning: Invalid UDP packet checksum rejected.");
         }
       }
 
@@ -100,9 +53,9 @@ public:
     }
 
     uint8_t txBuffer[kMaxPacketSize + 4];
-    const size_t txLength = signAndWrap(buffer, length, txBuffer);
+    const size_t txLength = wrapPacket(buffer, length, txBuffer, sizeof(txBuffer), kNetworkSecret);
 
-    if (!udp.beginPacket(kBroadcastIp, kProtocolPort)) {
+    if (txLength == 0 || !udp.beginPacket(kBroadcastIp, kProtocolPort)) {
       return false;
     }
 
@@ -137,6 +90,7 @@ public:
 
   void begin() override {
     mqttClient.setServer(kMqttBroker, kMqttPort);
+    mqttClient.setSocketTimeout(1);
     mqttClient.setCallback(mqttCallbackWrapper);
   }
 
@@ -153,19 +107,19 @@ public:
     }
 
     uint8_t txBuffer[kMaxPacketSize + 4];
-    const size_t txLength = signAndWrap(buffer, length, txBuffer);
+    const size_t txLength = wrapPacket(buffer, length, txBuffer, sizeof(txBuffer), kNetworkSecret);
 
-    return mqttClient.publish(kMqttTopic, txBuffer, txLength);
+    return txLength != 0 && mqttClient.publish(kMqttTopic, txBuffer, txLength);
   }
 
   void handleIncoming(const uint8_t* payload, unsigned int length) {
-    if (length > 4 && packetHandler) {
+    if (length > 4 && length <= kMaxPacketSize + kPacketChecksumSize && packetHandler) {
       uint8_t unwrapped[kMaxPacketSize];
       size_t unwrappedLength = 0;
-      if (verifyAndUnwrap(payload, length, unwrapped, unwrappedLength)) {
+      if (unwrapPacket(payload, length, unwrapped, sizeof(unwrapped), unwrappedLength, kNetworkSecret)) {
         packetHandler(unwrapped, unwrappedLength, millis());
       } else {
-        Serial.println("Warning: Invalid MQTT packet signature rejected.");
+        Serial.println("Warning: Invalid MQTT packet checksum rejected.");
       }
     }
   }

@@ -12,13 +12,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
-TEMPERATURE_PACKET = 0x01
-MODEL_PACKET = 0x02
-AGGREGATION_PACKET = 0x03
-DISCOVERY_PACKET = 0x04
-PROTOCOL_VERSION = 0x01
-ROLE_FLAG_AGGREGATOR_ELIGIBLE = 0x01
-ROLE_FLAG_AUTO_NEIGHBOR = 0x02
+from .protocol import (ModelParameters, decode_packet, newer_round, NETWORK_SECRET,
+    TEMPERATURE_PACKET, MODEL_PACKET, AGGREGATION_PACKET, DISCOVERY_PACKET,
+    PROTOCOL_VERSION, ROLE_FLAG_AGGREGATOR_ELIGIBLE)
+
 HISTORY_LIMIT = 40
 
 HTML = """<!doctype html>
@@ -297,7 +294,7 @@ HTML = """<!doctype html>
     <section class="hero">
       <div>
         <h1 class="title">Physics-Informed<br>Federated Learning Dashboard</h1>
-        <p class="subtitle">Live FL output for ESP8266 nodes: participant state, local losses, federated rounds, and global model convergence from the custom binary protocol.</p>
+        <p class="subtitle">Live FL output for ESP8266 nodes: participant state, local losses, federated rounds, and global parameter history from the custom binary protocol.</p>
       </div>
       <div class="panel stats" id="summary"></div>
     </section>
@@ -402,7 +399,7 @@ HTML = """<!doctype html>
           <div class="temperature">${fmt(node.temperature_c, 2)}<span class="mono"> C</span></div>
           <div class="chips">
             <span class="chip">round ${node.round || 0}</span>
-            <span class="chip">loss ${fmt(node.loss, 4)}</span>
+            <span class="chip">training loss ${fmt(node.loss, 4)}</span>
             <span class="chip">weight ${fmt(node.aggregation_weight, 3)}</span>
             ${(node.role_flags & 1) ? `<span class="chip"><span class="swatch" style="background:${palette[index % palette.length]}"></span>agg-capable</span>` : ""}
           </div>
@@ -427,7 +424,7 @@ HTML = """<!doctype html>
           <h3>Latest Aggregate</h3>
           <div class="metric-row"><span class="metric-label">Aggregator</span><span class="mono">${data.global_sender}</span></div>
           <div class="metric-row"><span class="metric-label">Global Round</span><span class="mono">${data.global_round}</span></div>
-          <div class="metric-row"><span class="metric-label">Global Loss</span><span class="mono">${fmt(data.global_loss, 4)}</span></div>
+          <div class="metric-row"><span class="metric-label">Contributor Training Loss</span><span class="mono">${fmt(data.mean_contributor_loss, 4)}</span></div>
           <div class="metric-row"><span class="metric-label">w1</span><span class="mono">${fmt(data.global_model.w1)}</span></div>
           <div class="metric-row"><span class="metric-label">w2</span><span class="mono">${fmt(data.global_model.w2)}</span></div>
           <div class="metric-row"><span class="metric-label">b</span><span class="mono">${fmt(data.global_model.b)}</span></div>
@@ -579,13 +576,6 @@ HTML = """<!doctype html>
 
 
 @dataclass
-class ModelParameters:
-    w1: float = 0.0
-    w2: float = 0.0
-    b: float = 0.0
-
-
-@dataclass
 class NodeTelemetry:
     node_id: int
     label: str
@@ -597,15 +587,14 @@ class NodeTelemetry:
     round: int = 0
     role_flags: int = 0
     last_seen: float = 0.0
+    temperature_seen: float = 0.0
+    model_seen: float = 0.0
+    boot_id: int = 0
+    sample_count: int = 0
+    base_round: int = 0
     loss_history: list[dict[str, float | int]] = field(default_factory=list)
     model_history: list[dict[str, float | int]] = field(default_factory=list)
 
-
-def read_float32_le(buffer: bytes, offset: int) -> float:
-    return struct.unpack("<f", buffer[offset:offset+4])[0]
-
-def read_uint16_le(buffer: bytes, offset: int) -> int:
-    return int.from_bytes(buffer[offset:offset + 2], "little", signed=False)
 
 def append_history(history: list[dict[str, float | int]], point: dict[str, float | int]) -> None:
     point_round = int(point.get("round", 0))
@@ -618,60 +607,13 @@ def append_history(history: list[dict[str, float | int]], point: dict[str, float
     if len(history) > HISTORY_LIMIT:
         del history[:-HISTORY_LIMIT]
 
-def decode_packet(packet: bytes) -> dict[str, Any] | None:
-    if len(packet) < 2:
-        return None
-    node_id = packet[0]
-    packet_type = packet[1]
-    if packet_type == TEMPERATURE_PACKET and len(packet) == 6:
-        temperature_c = read_float32_le(packet, 2)
-        return {"kind": "temperature", "node_id": node_id, "temperature_c": temperature_c}
-    if packet_type == MODEL_PACKET and len(packet) == 24:
-        model = ModelParameters(
-            w1=read_float32_le(packet, 2),
-            w2=read_float32_le(packet, 6),
-            b=read_float32_le(packet, 10),
-        )
-        weight = read_float32_le(packet, 14)
-        round_num = read_uint16_le(packet, 18)
-        loss = read_float32_le(packet, 20)
-        return {
-            "kind": "model",
-            "node_id": node_id,
-            "model": model,
-            "weight": weight,
-            "round": round_num,
-            "loss": loss,
-        }
-    if packet_type == AGGREGATION_PACKET and len(packet) == 20:
-        model = ModelParameters(
-            w1=read_float32_le(packet, 2),
-            w2=read_float32_le(packet, 6),
-            b=read_float32_le(packet, 10),
-        )
-        round_num = read_uint16_le(packet, 14)
-        loss = read_float32_le(packet, 16)
-        return {
-            "kind": "aggregation",
-            "node_id": node_id,
-            "model": model,
-            "round": round_num,
-            "loss": loss,
-        }
-    if packet_type == DISCOVERY_PACKET and len(packet) == 4 and packet[3] == PROTOCOL_VERSION:
-        return {
-            "kind": "discovery",
-            "node_id": node_id,
-            "role_flags": packet[2],
-        }
-    return None
-
-
 class DashboardState:
-    def __init__(self, udp_port: int, http_port: int, layout: dict[int, dict[str, Any]]):
+    def __init__(self, udp_port: int, http_port: int, layout: dict[int, dict[str, Any]], aggregator_id: int = 0):
         self.udp_port = udp_port
         self.http_port = http_port
         self.layout = layout
+        self.aggregator_id = aggregator_id
+        self.global_boot_id = 0
         self.lock = threading.Lock()
         self.nodes: dict[int, NodeTelemetry] = {}
         self.packet_counters = {"temperature": 0, "model": 0, "aggregation": 0, "discovery": 0}
@@ -679,7 +621,7 @@ class DashboardState:
         self.global_sender: int | None = None
         self.global_seen: float = 0.0
         self.global_round: int = 0
-        self.global_loss: float | None = None
+        self.mean_contributor_loss: float | None = None
         self.global_history: list[dict[str, Any]] = []
 
     def get_or_create_node(self, node_id: int, address: str) -> NodeTelemetry:
@@ -693,18 +635,23 @@ class DashboardState:
             node.address = address
         return node
 
-    def update_discovery(self, node_id: int, role_flags: int, address: str) -> None:
+    def update_discovery(self, node_id: int, role_flags: int, address: str, boot_id: int = 0) -> None:
         with self.lock:
             node = self.get_or_create_node(node_id, address)
+            if node.boot_id and node.boot_id != boot_id:
+                node = NodeTelemetry(node_id=node_id, label=node.label, address=address)
+                self.nodes[node_id] = node
+            node.boot_id = boot_id
             node.role_flags = role_flags
-            node.last_seen = time.time()
+            node.last_seen = time.monotonic()
             self.packet_counters["discovery"] += 1
 
     def update_temperature(self, node_id: int, temperature_c: float, address: str) -> None:
         with self.lock:
             node = self.get_or_create_node(node_id, address)
             node.temperature_c = temperature_c
-            node.last_seen = time.time()
+            node.temperature_seen = time.monotonic()
+            node.last_seen = time.monotonic()
             self.packet_counters["temperature"] += 1
 
     def update_model(
@@ -715,14 +662,20 @@ class DashboardState:
         round_num: int,
         loss: float | None,
         address: str,
+        base_round: int = 0,
     ) -> None:
         with self.lock:
             node = self.get_or_create_node(node_id, address)
+            if node.model_seen and not newer_round(round_num, node.round):
+                return
+            node.model_seen = time.monotonic()
+            node.sample_count = int(weight)
+            node.base_round = base_round
             node.model = model
             node.aggregation_weight = weight
             node.round = round_num
             node.loss = loss
-            node.last_seen = time.time()
+            node.last_seen = time.monotonic()
             if round_num > 0:
                 append_history(
                     node.model_history,
@@ -732,51 +685,56 @@ class DashboardState:
                     append_history(node.loss_history, {"round": round_num, "loss": loss})
             self.packet_counters["model"] += 1
 
-    def update_global(
-        self,
-        node_id: int,
-        model: ModelParameters,
-        round_num: int,
-        loss: float | None,
-        address: str,
-    ) -> None:
+    def update_global(self, node_id: int, model: ModelParameters, round_num: int,
+                      mean_loss: float, address: str, boot_id: int) -> bool:
         with self.lock:
-            node = self.get_or_create_node(node_id, address)
-            node.last_seen = time.time()
+            now = time.monotonic()
+            eligible = [n.node_id for n in self.nodes.values()
+                        if n.boot_id and n.role_flags & 1 and now - n.last_seen <= 6]
+            elected = self.aggregator_id or (min(eligible) if eligible else None)
+            node = self.nodes.get(node_id)
+            if elected != node_id or node is None or node.boot_id != boot_id:
+                return False
+            same_session = self.global_sender == node_id and self.global_boot_id == boot_id
+            if same_session and not newer_round(round_num, self.global_round):
+                return False
+            if not same_session:
+                self.global_history.clear()
+            node.last_seen = now
             self.global_model = model
             self.global_sender = node_id
-            self.global_seen = time.time()
+            self.global_boot_id = boot_id
+            self.global_seen = now
             self.global_round = round_num
-            self.global_loss = loss
-            if round_num > 0:
-                append_history(
-                    self.global_history,
-                    {
-                        "round": round_num,
-                        "loss": loss,
-                        "sender": node_id,
-                        "model": {"w1": model.w1, "w2": model.w2, "b": model.b},
-                    },
-                )
+            self.mean_contributor_loss = mean_loss
+            append_history(self.global_history, {
+                "round": round_num, "mean_contributor_loss": mean_loss, "sender": node_id,
+                "model": {"w1": model.w1, "w2": model.w2, "b": model.b}})
             self.packet_counters["aggregation"] += 1
+            return True
 
     def snapshot(self) -> dict[str, Any]:
         with self.lock:
-            now = time.time()
+            now = time.monotonic()
             nodes = []
             losses = []
             participants = 0
             for node in sorted(self.nodes.values(), key=lambda item: item.node_id):
-                if node.round > 0:
+                online = now - node.last_seen <= 6
+                model_fresh = node.model_seen > 0 and now - node.model_seen <= 15
+                if online and model_fresh and node.sample_count > 0:
                     participants += 1
-                if node.loss is not None:
+                if online and model_fresh and node.loss is not None:
                     losses.append(node.loss)
                 nodes.append(
                     {
                         "node_id": node.node_id,
                         "label": node.label,
                         "address": node.address,
-                        "temperature_c": node.temperature_c,
+                        "temperature_c": node.temperature_c if now - node.temperature_seen <= 6 else None,
+                        "online": online,
+                        "sample_count": node.sample_count,
+                        "base_round": node.base_round,
                         "aggregation_weight": node.aggregation_weight,
                         "age_s": now - node.last_seen if node.last_seen else None,
                         "round": node.round,
@@ -795,6 +753,7 @@ class DashboardState:
                 "udp_port": self.udp_port,
                 "http_port": self.http_port,
                 "node_count": len(nodes),
+                "active_node_count": sum(n["online"] for n in nodes),
                 "participant_count": participants,
                 "average_local_loss": (sum(losses) / len(losses)) if losses else None,
                 "nodes": nodes,
@@ -802,7 +761,7 @@ class DashboardState:
                 "global_sender": self.global_sender,
                 "global_age_s": now - self.global_seen if self.global_seen else None,
                 "global_round": self.global_round,
-                "global_loss": self.global_loss,
+                "mean_contributor_loss": self.mean_contributor_loss,
                 "global_model": None,
                 "global_history": list(self.global_history),
             }
@@ -828,51 +787,41 @@ def load_layout(path: Path | None) -> dict[int, dict[str, Any]]:
     return layout
 
 
-def run_udp_listener(
-    state: DashboardState,
-    bind_host: str,
-    stop_event: threading.Event | None = None,
-    ready_event: threading.Event | None = None,
-) -> None:
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.bind((bind_host, state.udp_port))
-    sock.settimeout(0.2)
-    if ready_event is not None:
-        ready_event.set()
-    try:
+def process_datagram(state: DashboardState, wire: bytes, source: str,
+                     key: str = NETWORK_SECRET) -> bool:
+    decoded = decode_packet(wire, key)
+    if decoded is None:
+        return False
+    kind, node = decoded["kind"], decoded["node_id"]
+    if kind == "discovery":
+        state.update_discovery(node, decoded["role_flags"], source, decoded["boot_id"])
+    elif kind == "temperature":
+        state.update_temperature(node, decoded["temperature_c"], source)
+    elif kind == "model":
+        state.update_model(node, decoded["model"], decoded["sample_count"], decoded["round"],
+                           decoded["mean_local_loss"], source, decoded["base_round"])
+    else:
+        return state.update_global(node, decoded["model"], decoded["round"],
+                                   decoded["mean_contributor_loss"], source, decoded["leader_boot_id"])
+    return True
+
+
+def run_udp_listener(state: DashboardState, bind_host: str,
+                     stop_event: threading.Event | None = None,
+                     ready_event: threading.Event | None = None,
+                     key: str = NETWORK_SECRET) -> None:
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind((bind_host, state.udp_port))
+        sock.settimeout(0.2)
+        if ready_event is not None:
+            ready_event.set()
         while stop_event is None or not stop_event.is_set():
             try:
                 packet, address = sock.recvfrom(2048)
-            except TimeoutError:
+            except socket.timeout:
                 continue
-            decoded = decode_packet(packet)
-            if decoded is None:
-                continue
-            source = f"{address[0]}:{address[1]}"
-            if decoded["kind"] == "discovery":
-                state.update_discovery(decoded["node_id"], decoded["role_flags"], source)
-            elif decoded["kind"] == "temperature":
-                state.update_temperature(decoded["node_id"], decoded["temperature_c"], source)
-            elif decoded["kind"] == "model":
-                state.update_model(
-                    decoded["node_id"],
-                    decoded["model"],
-                    decoded["weight"],
-                    decoded["round"],
-                    decoded["loss"],
-                    source,
-                )
-            else:
-                state.update_global(
-                    decoded["node_id"],
-                    decoded["model"],
-                    decoded["round"],
-                    decoded["loss"],
-                    source,
-                )
-    finally:
-        sock.close()
+            process_datagram(state, packet, f"{address[0]}:{address[1]}", key)
 
 
 def create_http_server(state: DashboardState, host: str, port: int) -> ThreadingHTTPServer:
@@ -893,7 +842,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.wfile.write(content)
             return
         if self.path == "/api/state":
-            body = json.dumps(self.state.snapshot()).encode("utf-8")
+            body = json.dumps(self.state.snapshot(), allow_nan=False).encode("utf-8")
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Cache-Control", "no-store")
@@ -913,16 +862,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--udp-port", type=int, default=4210)
     parser.add_argument("--http-host", default="127.0.0.1")
     parser.add_argument("--http-port", type=int, default=8080)
-    parser.add_argument("--layout", type=Path, default=Path("pifl_vis/layout.sample.json"))
+    parser.add_argument("--layout", type=Path, default=Path(__file__).with_name("layout.sample.json"))
+    parser.add_argument("--network-secret", default=NETWORK_SECRET)
+    parser.add_argument("--aggregator-id", type=int, default=0)
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
     layout = load_layout(args.layout)
-    state = DashboardState(args.udp_port, args.http_port, layout)
+    state = DashboardState(args.udp_port, args.http_port, layout, args.aggregator_id)
 
-    listener = threading.Thread(target=run_udp_listener, args=(state, args.udp_host), daemon=True)
+    listener = threading.Thread(target=run_udp_listener, args=(state, args.udp_host, None, None, args.network_secret), daemon=True)
     listener.start()
 
     server = create_http_server(state, args.http_host, args.http_port)

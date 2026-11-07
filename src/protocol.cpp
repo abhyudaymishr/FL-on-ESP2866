@@ -1,149 +1,95 @@
 #include "protocol.h"
-#include <string.h> // for memcpy
+#include "config.h"
+#include <math.h>
+#include <string.h>
 
 namespace pifl {
-
 namespace {
-
-void writeFloat32LE(uint8_t* buffer, const float value) {
-  // ESP8266 is little-endian, so we can just memcpy the float directly.
-  memcpy(buffer, &value, sizeof(float));
+void write32(uint8_t* b, uint32_t value) {
+  for (unsigned i = 0; i < 4; ++i) b[i] = static_cast<uint8_t>(value >> (8*i));
 }
-
-float readFloat32LE(const uint8_t* buffer) {
-  float value;
-  memcpy(&value, buffer, sizeof(float));
+uint32_t read32(const uint8_t* b) {
+  uint32_t value = 0;
+  for (unsigned i = 0; i < 4; ++i) value |= static_cast<uint32_t>(b[i]) << (8*i);
   return value;
 }
-
-void writeUInt16LE(uint8_t* buffer, const uint16_t value) {
-  buffer[0] = static_cast<uint8_t>(value & 0xFF);
-  buffer[1] = static_cast<uint8_t>((value >> 8) & 0xFF);
+void write16(uint8_t* b, uint16_t value) { b[0] = value & 255; b[1] = value >> 8; }
+uint16_t read16(const uint8_t* b) { return b[0] | (static_cast<uint16_t>(b[1]) << 8); }
+void writeFloat(uint8_t* b, float value) {
+  static_assert(sizeof(float) == 4, "Protocol requires IEEE-754 float32");
+  uint32_t bits; memcpy(&bits, &value, 4); write32(b, bits);
 }
-
-uint16_t readUInt16LE(const uint8_t* buffer) {
-  return static_cast<uint16_t>(buffer[0]) | (static_cast<uint16_t>(buffer[1]) << 8);
+float readFloat(const uint8_t* b) { uint32_t bits = read32(b); float v; memcpy(&v, &bits, 4); return v; }
+void writeModel(uint8_t* b, const ModelParameters& m) {
+  writeFloat(b, m.w1); writeFloat(b+4, m.w2); writeFloat(b+8, m.b);
 }
-
+ModelParameters readModel(const uint8_t* b) { return {readFloat(b), readFloat(b+4), readFloat(b+8)}; }
+bool header(const uint8_t* b, size_t n, PacketType expected, size_t size) {
+  return b && n == size && b[0] != 0 && b[1] == static_cast<uint8_t>(expected) && b[2] == kProtocolVersion;
 }
-
-bool getPacketType(const uint8_t* buffer, const size_t length, PacketType& type, uint8_t& nodeId) {
-  if (length < kPacketHeaderSize) {
-    return false;
-  }
-  nodeId = buffer[0];
-  type = static_cast<PacketType>(buffer[1]);
-  return true;
+void writeHeader(uint8_t* b, uint8_t id, PacketType type) {
+  b[0] = id; b[1] = static_cast<uint8_t>(type); b[2] = kProtocolVersion;
 }
-
-size_t encodeTemperaturePacket(const uint8_t nodeId, const float temperatureC, uint8_t* buffer,
-                               const size_t capacity) {
-  if (capacity < kTemperaturePacketSize) {
-    return 0;
-  }
-
-  buffer[0] = nodeId;
-  buffer[1] = static_cast<uint8_t>(PacketType::Temperature);
-  writeFloat32LE(&buffer[2], temperatureC);
-  return kTemperaturePacketSize;
 }
-
-size_t encodeModelPacket(const uint8_t nodeId, const ModelParameters& model, const float weight,
-                         const float loss, const uint16_t round, uint8_t* buffer,
-                         const size_t capacity) {
-  if (capacity < kModelPacketSize) {
-    return 0;
-  }
-
-  buffer[0] = nodeId;
-  buffer[1] = static_cast<uint8_t>(PacketType::ModelUpdate);
-  writeFloat32LE(&buffer[2], model.w1);
-  writeFloat32LE(&buffer[6], model.w2);
-  writeFloat32LE(&buffer[10], model.b);
-  writeFloat32LE(&buffer[14], weight);
-  writeUInt16LE(&buffer[18], round);
-  writeFloat32LE(&buffer[20], loss);
+bool isValidTemperature(float value) {
+  return isfinite(value) && value >= kMinTemperatureC && value <= kMaxTemperatureC;
+}
+bool isValidModel(const ModelParameters& m) {
+  return isfinite(m.w1) && isfinite(m.w2) && isfinite(m.b) &&
+      fabsf(m.w1) <= kMaxAbsW1 && fabsf(m.w2) <= kMaxAbsW2 && fabsf(m.b) <= kMaxAbsB;
+}
+bool isNewerRound(uint16_t candidate, uint16_t previous) {
+  const uint16_t delta = static_cast<uint16_t>(candidate - previous);
+  return delta != 0 && delta < 0x8000u;
+}
+bool getPacketType(const uint8_t* b, size_t n, PacketType& type, uint8_t& id) {
+  if (!b || n < kPacketHeaderSize || b[0] == 0 || b[2] != kProtocolVersion || b[1] < 1 || b[1] > 4) return false;
+  id = b[0]; type = static_cast<PacketType>(b[1]); return true;
+}
+size_t encodeTemperaturePacket(uint8_t id, float t, uint8_t* b, size_t cap) {
+  if (!b || !id || cap < kTemperaturePacketSize || !isValidTemperature(t)) return 0;
+  writeHeader(b, id, PacketType::Temperature); writeFloat(b+3, t); return kTemperaturePacketSize;
+}
+size_t encodeModelPacket(const ModelPacket& p, uint8_t* b, size_t cap) {
+  if (!b || !p.nodeId || cap < kModelPacketSize || !isValidModel(p.model) || !p.sampleCount ||
+      !isfinite(p.meanLocalLoss) || p.meanLocalLoss < 0 || !p.senderBootId ||
+      !((p.baseLeaderId == 0 && p.baseLeaderBootId == 0 && p.baseRound == 0) ||
+        (p.baseLeaderId != 0 && p.baseLeaderBootId != 0))) return 0;
+  writeHeader(b, p.nodeId, PacketType::ModelUpdate); writeModel(b+3, p.model);
+  write32(b+15, p.sampleCount); write16(b+19, p.round); writeFloat(b+21, p.meanLocalLoss);
+  write16(b+25, p.baseRound); b[27] = p.baseLeaderId; write32(b+28, p.baseLeaderBootId); write32(b+32, p.senderBootId);
   return kModelPacketSize;
 }
-
-size_t encodeAggregationPacket(const uint8_t nodeId, const ModelParameters& model, const float loss,
-                               const uint16_t round, uint8_t* buffer, const size_t capacity) {
-  if (capacity < kAggregationPacketSize) {
-    return 0;
-  }
-
-  buffer[0] = nodeId;
-  buffer[1] = static_cast<uint8_t>(PacketType::GlobalAggregation);
-  writeFloat32LE(&buffer[2], model.w1);
-  writeFloat32LE(&buffer[6], model.w2);
-  writeFloat32LE(&buffer[10], model.b);
-  writeUInt16LE(&buffer[14], round);
-  writeFloat32LE(&buffer[16], loss);
+size_t encodeAggregationPacket(const AggregationPacket& p, uint8_t* b, size_t cap) {
+  if (!b || !p.nodeId || !p.leaderBootId || cap < kAggregationPacketSize || !isValidModel(p.model) ||
+      !isfinite(p.meanLocalLoss) || p.meanLocalLoss < 0) return 0;
+  writeHeader(b, p.nodeId, PacketType::GlobalAggregation); writeModel(b+3, p.model);
+  write16(b+15, p.round); writeFloat(b+17, p.meanLocalLoss); write32(b+21, p.leaderBootId);
   return kAggregationPacketSize;
 }
-
-size_t encodeDiscoveryPacket(const uint8_t nodeId, const uint8_t roleFlags, uint8_t* buffer,
-                             const size_t capacity) {
-  if (capacity < kDiscoveryPacketSize) {
-    return 0;
-  }
-
-  buffer[0] = nodeId;
-  buffer[1] = static_cast<uint8_t>(PacketType::Discovery);
-  buffer[2] = roleFlags;
-  buffer[3] = kProtocolVersion;
+size_t encodeDiscoveryPacket(const DiscoveryPacket& p, uint8_t* b, size_t cap) {
+  if (!b || !p.nodeId || !p.bootId || cap < kDiscoveryPacketSize || (p.roleFlags & ~kRoleFlagAggregatorEligible)) return 0;
+  writeHeader(b, p.nodeId, PacketType::Discovery); b[3] = p.roleFlags; write32(b+4, p.bootId);
   return kDiscoveryPacketSize;
 }
-
-bool decodeTemperaturePacket(const uint8_t* buffer, const size_t length, TemperaturePacket& packet) {
-  if (length != kTemperaturePacketSize || buffer[1] != static_cast<uint8_t>(PacketType::Temperature)) {
-    return false;
-  }
-
-  packet.nodeId = buffer[0];
-  packet.temperatureC = readFloat32LE(&buffer[2]);
-  return true;
+bool decodeTemperaturePacket(const uint8_t* b, size_t n, TemperaturePacket& p) {
+  if (!header(b,n,PacketType::Temperature,kTemperaturePacketSize)) return false;
+  p = {b[0],readFloat(b+3)}; return isValidTemperature(p.temperatureC);
 }
-
-bool decodeModelPacket(const uint8_t* buffer, const size_t length, ModelPacket& packet) {
-  // Allow backwards compat or variable length check if needed, but we rewrote to native
-  if (length != kModelPacketSize || buffer[1] != static_cast<uint8_t>(PacketType::ModelUpdate)) {
-    return false;
-  }
-
-  packet.nodeId = buffer[0];
-  packet.model.w1 = readFloat32LE(&buffer[2]);
-  packet.model.w2 = readFloat32LE(&buffer[6]);
-  packet.model.b = readFloat32LE(&buffer[10]);
-  packet.weight = readFloat32LE(&buffer[14]);
-  packet.round = readUInt16LE(&buffer[18]);
-  packet.loss = readFloat32LE(&buffer[20]);
-  return true;
+bool decodeModelPacket(const uint8_t* b, size_t n, ModelPacket& p) {
+  if (!header(b,n,PacketType::ModelUpdate,kModelPacketSize)) return false;
+  p = {b[0],readModel(b+3),read32(b+15),readFloat(b+21),read16(b+19),read16(b+25),b[27],read32(b+28),read32(b+32)};
+  return isValidModel(p.model) && p.senderBootId && p.sampleCount > 0 && isfinite(p.meanLocalLoss) && p.meanLocalLoss >= 0 &&
+      ((p.baseLeaderId == 0 && p.baseLeaderBootId == 0 && p.baseRound == 0) ||
+       (p.baseLeaderId != 0 && p.baseLeaderBootId != 0));
 }
-
-bool decodeAggregationPacket(const uint8_t* buffer, const size_t length, AggregationPacket& packet) {
-  if (length != kAggregationPacketSize || buffer[1] != static_cast<uint8_t>(PacketType::GlobalAggregation)) {
-    return false;
-  }
-
-  packet.nodeId = buffer[0];
-  packet.model.w1 = readFloat32LE(&buffer[2]);
-  packet.model.w2 = readFloat32LE(&buffer[6]);
-  packet.model.b = readFloat32LE(&buffer[10]);
-  packet.round = readUInt16LE(&buffer[14]);
-  packet.loss = readFloat32LE(&buffer[16]);
-  return true;
+bool decodeAggregationPacket(const uint8_t* b, size_t n, AggregationPacket& p) {
+  if (!header(b,n,PacketType::GlobalAggregation,kAggregationPacketSize)) return false;
+  p = {b[0],readModel(b+3),readFloat(b+17),read16(b+15),read32(b+21)};
+  return isValidModel(p.model) && p.leaderBootId && isfinite(p.meanLocalLoss) && p.meanLocalLoss >= 0;
 }
-
-bool decodeDiscoveryPacket(const uint8_t* buffer, const size_t length, DiscoveryPacket& packet) {
-  if (length != kDiscoveryPacketSize || buffer[1] != static_cast<uint8_t>(PacketType::Discovery)) {
-    return false;
-  }
-
-  packet.nodeId = buffer[0];
-  packet.roleFlags = buffer[2];
-  packet.protocolVersion = buffer[3];
-  return packet.protocolVersion == kProtocolVersion;
+bool decodeDiscoveryPacket(const uint8_t* b, size_t n, DiscoveryPacket& p) {
+  if (!header(b,n,PacketType::Discovery,kDiscoveryPacketSize)) return false;
+  p = {b[0],b[3],read32(b+4)}; return p.bootId && !(p.roleFlags & ~kRoleFlagAggregatorEligible);
 }
-
 }

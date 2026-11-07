@@ -1,6 +1,10 @@
 #include <Arduino.h>
 #include <ESP8266WiFi.h>
 #include <WiFiManager.h>
+extern "C" {
+#include <osapi.h>
+#include <user_interface.h>
+}
 
 #include "config.h"
 #include "node_state.h"
@@ -31,9 +35,6 @@ uint8_t localRoleFlags() {
   uint8_t flags = 0;
   if (kAggregationEnabled) {
     flags |= kRoleFlagAggregatorEligible;
-  }
-  if (kAutoAssignNeighbors) {
-    flags |= kRoleFlagAutoNeighbor;
   }
   return flags;
 }
@@ -72,11 +73,9 @@ void broadcastTemperature() {
 
 void broadcastModel() {
   uint8_t buffer[kModelPacketSize];
-  const float weight = computeAggregationWeight(gNodeState.lastLaplacian);
   const uint16_t nextRound = static_cast<uint16_t>(gNodeState.localModelRound + 1);
-  const size_t length = encodeModelPacket(gNodeState.localNodeId, gNodeState.model, weight,
-                                          gNodeState.lastLocalLoss, nextRound, buffer,
-                                          sizeof(buffer));
+  const ModelPacket packet = buildLocalModelPacket(gNodeState, nextRound);
+  const size_t length = encodeModelPacket(packet, buffer, sizeof(buffer));
   if (sendPacket(buffer, length)) {
     gNodeState.localModelRound = nextRound;
   }
@@ -89,12 +88,11 @@ void broadcastAggregation() {
   }
 
   uint8_t buffer[kAggregationPacketSize];
-  const size_t length = encodeAggregationPacket(gNodeState.localNodeId, packet.model, packet.loss,
-                                                packet.round, buffer, sizeof(buffer));
+  const size_t length = encodeAggregationPacket(packet, buffer, sizeof(buffer));
   if (sendPacket(buffer, length)) {
     applyGlobalModel(gNodeState, packet);
-    Serial.printf("Broadcast global aggregated model. round=%u loss=%.4f\n", packet.round,
-                  packet.loss);
+    Serial.printf("Broadcast aggregate. round=%u contributor_mean_loss=%.4f\n", packet.round,
+                  packet.meanLocalLoss);
     logModel("Global model", packet.model);
   }
 }
@@ -102,7 +100,7 @@ void broadcastAggregation() {
 void broadcastDiscovery() {
   uint8_t buffer[kDiscoveryPacketSize];
   const size_t length =
-      encodeDiscoveryPacket(gNodeState.localNodeId, localRoleFlags(), buffer, sizeof(buffer));
+      encodeDiscoveryPacket({gNodeState.localNodeId, localRoleFlags(), gNodeState.bootId}, buffer, sizeof(buffer));
   sendPacket(buffer, length);
 }
 
@@ -139,7 +137,7 @@ void handleAggregationPacket(const uint8_t* buffer, const size_t length) {
     return;
   }
 
-  applyGlobalModel(gNodeState, packet);
+  if (!applyGlobalModel(gNodeState, packet)) return;
   Serial.println("Applied global model update from aggregator.");
   logModel("Local model", gNodeState.model);
 }
@@ -149,10 +147,6 @@ void handleDiscoveryPacket(const uint8_t* buffer, const size_t length, const uin
   if (!decodeDiscoveryPacket(buffer, length, packet)) {
     return;
   }
-  if (packet.nodeId == gNodeState.localNodeId) {
-    return;
-  }
-
   registerLivePeer(gNodeState, packet, nowMs);
 }
 
@@ -161,7 +155,7 @@ void handleIncomingPacket(const uint8_t* buffer, size_t length, uint32_t nowMs) 
     PacketType packetType;
     uint8_t sourceNodeId = 0;
     if (getPacketType(buffer, length, packetType, sourceNodeId) &&
-        sourceNodeId != gNodeState.localNodeId) {
+        (sourceNodeId != gNodeState.localNodeId || packetType == PacketType::Discovery)) {
       switch (packetType) {
         case PacketType::Temperature:
           handleTemperaturePacket(buffer, length, nowMs);
@@ -180,23 +174,20 @@ void handleIncomingPacket(const uint8_t* buffer, size_t length, uint32_t nowMs) 
   }
 }
 
-void performSampleStep(const uint32_t nowMs, const float dtSeconds) {
+void performSampleStep(const uint32_t nowMs) {
   const float measuredTemperatureC = gSensor->readTemperatureC(gNodeState.localNodeId, nowMs);
-  const float previousPredictionC = gNodeState.pendingPredictionC;
-  const bool hadPrediction = gNodeState.hasPendingPrediction;
-
-  applyMeasurement(gNodeState, measuredTemperatureC, dtSeconds);
-
-  Serial.printf("node=%u peers=%u T=%.2fC lap=%.4f diff=%.4f corr=%.4f pred=%.2fC",
-                gNodeState.localNodeId, static_cast<unsigned>(countOnlinePeers(gNodeState)),
-                gNodeState.currentTempC, gNodeState.lastLaplacian, gNodeState.lastDiffusionTerm,
-                gNodeState.lastCorrectionTerm, gNodeState.pendingPredictionC);
-  if (hadPrediction) {
-    const float error = measuredTemperatureC - previousPredictionC;
-    Serial.printf(" error=%.4f sgd=%.4f loss=%.4f", error, gNodeState.lastPredictionError,
-                  gNodeState.lastLocalLoss);
+  const uint32_t measuredMs = millis();
+  const float elapsedSeconds = gNodeState.lastMeasurementMs == 0 ? kSamplePeriodMs / 1000.0f :
+      (measuredMs - gNodeState.lastMeasurementMs) / 1000.0f;
+  gNodeState.lastMeasurementMs = measuredMs;
+  if (!applyMeasurement(gNodeState, measuredTemperatureC, elapsedSeconds)) {
+    Serial.println("Skipped invalid sensor reading or conflicting node identity.");
+    return;
   }
-  Serial.println();
+  Serial.printf("node=%u peers=%u T=%.2fC lap=%.4f pred=%.2fC error=%.4f loss=%.4f\n",
+      gNodeState.localNodeId, static_cast<unsigned>(countOnlinePeers(gNodeState)),
+      gNodeState.currentTempC, gNodeState.lastLaplacian, gNodeState.pendingPredictionC,
+      gNodeState.lastPredictionError, gNodeState.lastLocalLoss);
 
   broadcastTemperature();
 
@@ -208,8 +199,8 @@ void performSampleStep(const uint32_t nowMs, const float dtSeconds) {
   if (nowMs - gNodeState.lastModelSyncMs >= kModelSyncPeriodMs) {
     broadcastModel();
     gNodeState.lastModelSyncMs = nowMs;
-    Serial.printf("FL local round=%u loss=%.4f weight=%.4f\n", gNodeState.localModelRound,
-                  gNodeState.lastLocalLoss, computeAggregationWeight(gNodeState.lastLaplacian));
+    Serial.printf("FL sync=%u samples=%lu local_loss=%.4f\n", gNodeState.localModelRound,
+                  static_cast<unsigned long>(gNodeState.localSampleCount), gNodeState.lastLocalLoss);
     logModel("Model sync", gNodeState.model);
   }
 
@@ -237,7 +228,7 @@ void setup() {
   Serial.println();
   Serial.println("Physics-informed federated thermal node booting...");
 
-  pifl::initializeNodeState(gNodeState, resolveLocalNodeId());
+  pifl::initializeNodeState(gNodeState, resolveLocalNodeId(), os_random());
   Serial.printf("Local node id=%u\n", gNodeState.localNodeId);
   setupWiFi();
 
@@ -262,14 +253,8 @@ void loop() {
   }
 
   if (nowMs - gNodeState.lastSampleMs >= pifl::kSamplePeriodMs) {
-    float dtSeconds = (gNodeState.lastSampleMs == 0) ? 
-        (static_cast<float>(pifl::kSamplePeriodMs) / 1000.0f) : 
-        (static_cast<float>(nowMs - gNodeState.lastSampleMs) / 1000.0f);
-    if (dtSeconds < 0.001f) {
-      dtSeconds = 0.001f;
-    }
     gNodeState.lastSampleMs = nowMs;
-    performSampleStep(nowMs, dtSeconds);
+    performSampleStep(nowMs);
   }
 
   yield();

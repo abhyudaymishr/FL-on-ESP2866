@@ -1,406 +1,186 @@
 #include "node_state.h"
-
+#include "node_model.h"
 #include <math.h>
 
-#include "discretization.h"
-#include "node_model.h"
-
 namespace pifl {
-
 namespace {
-
-float effectiveNeighborTemperature(const NodeState& state, const NeighborObservation& neighbor) {
-  return neighbor.valid ? neighbor.temperatureC : state.currentTempC;
-}
-
-size_t findPeerSlot(const NodeState& state, const uint8_t nodeId) {
-  size_t emptySlot = kMaxFederatedPeers;
-
-  for (size_t index = 0; index < kMaxFederatedPeers; ++index) {
-    if (state.peerModels[index].valid && state.peerModels[index].nodeId == nodeId) {
-      return index;
-    }
-    if (!state.peerModels[index].valid && emptySlot == kMaxFederatedPeers) {
-      emptySlot = index;
-    }
+LivePeerState* touchPeer(NodeState& s, uint8_t id, uint32_t now) {
+  if (!id || id == s.localNodeId) return nullptr;
+  LivePeerState* empty = nullptr;
+  for (auto& peer : s.livePeers) {
+    if (peer.valid && peer.nodeId == id) { peer.lastSeenMs = now; return &peer; }
+    if (!peer.valid && !empty) empty = &peer;
   }
-
-  return emptySlot;
+  if (!empty) return nullptr;
+  *empty = {};
+  empty->nodeId=id; empty->valid=true; empty->lastSeenMs=now;
+  return empty;
 }
-
-size_t findLivePeerSlot(const NodeState& state, const uint8_t nodeId) {
-  size_t emptySlot = kMaxRealtimePeers;
-
-  for (size_t index = 0; index < kMaxRealtimePeers; ++index) {
-    if (state.livePeers[index].valid && state.livePeers[index].nodeId == nodeId) {
-      return index;
-    }
-    if (!state.livePeers[index].valid && emptySlot == kMaxRealtimePeers) {
-      emptySlot = index;
-    }
+FiniteDifferenceStencil buildStencil(const NodeState& s) {
+  FiniteDifferenceStencil stencil{s.currentTempC,0,0,0,0,0};
+  float values[NeighborCount];
+  for (unsigned i=0; i<NeighborCount; ++i) {
+    const auto& n=s.neighbors[i];
+    if (n.nodeId && n.valid) values[i]=n.temperatureC;
+    else if (kBoundaryCondition == BoundaryCondition::AmbientDirichlet) values[i]=kAmbientTemperatureC;
+    else { values[i]=s.currentTempC; stencil.zeroFluxMask |= 1u << i; }
   }
-
-  return emptySlot;
+  stencil.northTempC=values[0]; stencil.southTempC=values[1];
+  stencil.eastTempC=values[2]; stencil.westTempC=values[3];
+  return stencil;
 }
-
-void clampModel(ModelParameters& model) {
-  if (!kClampModelParameters) {
+bool matchesBase(const NodeState& s, uint8_t leader, uint32_t boot, uint16_t round) {
+  return leader == s.globalLeaderId && boot == s.globalLeaderBootId && round == s.lastGlobalRound;
+}
+uint32_t leaderBootId(const NodeState& s, uint8_t id) {
+  if (id == s.localNodeId) return s.bootId;
+  for (const auto& peer : s.livePeers) if (peer.valid && peer.nodeId == id) return peer.bootId;
+  return 0;
+}
+void clampModel(ModelParameters& m) {
+  if (kClampModelParameters) clampPhase2Model(m,kMaxAbsW1,kMaxAbsW2,kMaxAbsB);
+}
+}
+void initializeNodeState(NodeState& s, uint8_t id, uint32_t bootId) {
+  s = {};
+  s.localNodeId=id; s.bootId=bootId ? bootId : 1;
+  s.currentTempC=kInitialTemperatureC; s.pendingPredictionC=kInitialTemperatureC; s.alpha=kAlpha;
+  for (unsigned i=0; i<NeighborCount; ++i) s.neighbors[i].nodeId=kNeighborIds[i];
+}
+void expireStaleData(NodeState& s, uint32_t now) {
+  for (auto& n : s.neighbors) if (n.valid && now-n.lastSeenMs > kNeighborTimeoutMs) n.valid=false;
+  for (auto& p : s.livePeers) {
+    if (p.hasTemperature && now-p.temperatureLastSeenMs > kNeighborTimeoutMs) p.hasTemperature=false;
+    if (p.valid && now-p.lastSeenMs > kRealtimePeerTimeoutMs) p.valid=false;
+  }
+  for (auto& p : s.peerModels) if (p.valid && now-p.lastSeenMs > kPeerModelTimeoutMs) p.valid=false;
+}
+void registerLivePeer(NodeState& s, const DiscoveryPacket& p, uint32_t now) {
+  if (!p.nodeId || !p.bootId || (p.roleFlags & ~kRoleFlagAggregatorEligible)) return;
+  if (p.nodeId == s.localNodeId) {
+    if (p.bootId != s.bootId) s.identityConflict=true;
     return;
   }
-
-  clampPhase2Model(model, kMaxAbsW1, kMaxAbsW2, kMaxAbsB);
+  auto* peer=touchPeer(s,p.nodeId,now);
+  if (!peer) return;
+  if (peer->bootId && peer->bootId != p.bootId) {
+    peer->hasTemperature=false;
+    for (auto& model : s.peerModels) if (model.nodeId == p.nodeId) model.valid=false;
+    for (auto& n : s.neighbors) if (n.nodeId == p.nodeId) n.valid=false;
+  }
+  peer->bootId=p.bootId; peer->roleFlags=p.roleFlags;
 }
-
-const LivePeerState* getLivePeerByNodeId(const NodeState& state, const uint8_t nodeId) {
-  for (size_t index = 0; index < kMaxRealtimePeers; ++index) {
-    if (state.livePeers[index].valid && state.livePeers[index].nodeId == nodeId) {
-      return &state.livePeers[index];
+void registerNeighborTemperature(NodeState& s, uint8_t id, float temperature, uint32_t now) {
+  if (!id || id == s.localNodeId || !isValidTemperature(temperature)) return;
+  auto* p=touchPeer(s,id,now);
+  if (p) { p->temperatureC=temperature; p->temperatureLastSeenMs=now; p->hasTemperature=true; }
+  for (auto& n : s.neighbors) if (n.nodeId == id) {
+    n.temperatureC=temperature; n.lastSeenMs=now; n.valid=true;
+  }
+}
+bool registerPeerModel(NodeState& s, const ModelPacket& p, uint32_t now) {
+  if (!p.nodeId || p.nodeId == s.localNodeId || !isValidModel(p.model) || !p.sampleCount ||
+      !isfinite(p.meanLocalLoss) || p.meanLocalLoss < 0 ||
+      !matchesBase(s,p.baseLeaderId,p.baseLeaderBootId,p.baseRound)) return false;
+  bool knownBoot=false;
+  for (const auto& live : s.livePeers) if (live.valid && live.nodeId == p.nodeId &&
+      live.bootId == p.senderBootId && p.senderBootId) knownBoot=true;
+  if (!knownBoot) return false;
+  PeerModelState* slot=nullptr;
+  for (auto& peer : s.peerModels) {
+    if (peer.valid && peer.nodeId == p.nodeId) {
+      if (!isNewerRound(p.round,peer.round) || p.sampleCount < peer.sampleCount) return false;
+      slot=&peer; break;
     }
+    if (!peer.valid && !slot) slot=&peer;
   }
-
-  return nullptr;
-}
-
-float dynamicPeerTemperature(const NodeState& state, const size_t rank) {
-  uint8_t usedIds[NeighborCount] = {0, 0, 0, 0};
-
-  for (size_t selection = 0; selection <= rank; ++selection) {
-    const LivePeerState* bestPeer = nullptr;
-
-    for (size_t index = 0; index < kMaxRealtimePeers; ++index) {
-      const LivePeerState& candidate = state.livePeers[index];
-      if (!candidate.valid || !candidate.hasTemperature || candidate.nodeId == state.localNodeId) {
-        continue;
-      }
-
-      bool alreadyUsed = false;
-      for (size_t usedIndex = 0; usedIndex < selection; ++usedIndex) {
-        if (usedIds[usedIndex] == candidate.nodeId) {
-          alreadyUsed = true;
-          break;
-        }
-      }
-      if (alreadyUsed) {
-        continue;
-      }
-
-      if (bestPeer == nullptr || candidate.nodeId < bestPeer->nodeId) {
-        bestPeer = &candidate;
-      }
-    }
-
-    if (bestPeer == nullptr) {
-      return state.currentTempC;
-    }
-
-    usedIds[selection] = bestPeer->nodeId;
-    if (selection == rank) {
-      return bestPeer->temperatureC;
-    }
-  }
-
-  return state.currentTempC;
-}
-
-float resolvedNeighborTemperature(const NodeState& state, const NeighborIndex index) {
-  const uint8_t configuredNodeId = state.neighbors[index].nodeId;
-
-  if (configuredNodeId != 0) {
-    const LivePeerState* livePeer = getLivePeerByNodeId(state, configuredNodeId);
-    if (livePeer != nullptr && livePeer->hasTemperature) {
-      return livePeer->temperatureC;
-    }
-    return effectiveNeighborTemperature(state, state.neighbors[index]);
-  }
-
-  if (kAutoAssignNeighbors) {
-    return dynamicPeerTemperature(state, static_cast<size_t>(index));
-  }
-
-  if (kBoundaryCondition == BoundaryCondition::AmbientDirichlet) {
-    return kAmbientTemperatureC;
-  }
-
-  return state.currentTempC;
-}
-
-void touchLivePeer(NodeState& state, const uint8_t nodeId, const uint32_t nowMs) {
-  if (nodeId == 0 || nodeId == state.localNodeId) {
-    return;
-  }
-
-  const size_t slot = findLivePeerSlot(state, nodeId);
-  if (slot >= kMaxRealtimePeers) {
-    return;
-  }
-
-  state.livePeers[slot].nodeId = nodeId;
-  state.livePeers[slot].lastSeenMs = nowMs;
-  state.livePeers[slot].valid = true;
-}
-
-FiniteDifferenceStencil buildStencil(const NodeState& state) {
-  return {
-      state.currentTempC,
-      resolvedNeighborTemperature(state, NeighborNorth),
-      resolvedNeighborTemperature(state, NeighborSouth),
-      resolvedNeighborTemperature(state, NeighborEast),
-      resolvedNeighborTemperature(state, NeighborWest),
-  };
-}
-
-}
-
-void initializeNodeState(NodeState& state, const uint8_t localNodeId) {
-  state.localNodeId = localNodeId;
-  state.currentTempC = kInitialTemperatureC;
-  state.pendingPredictionC = kInitialTemperatureC;
-  state.lastPredictionInputC = kInitialTemperatureC;
-  state.lastLaplacian = 0.0f;
-  state.lastDiffusionTerm = 0.0f;
-  state.lastCorrectionTerm = 0.0f;
-  state.lastPredictionError = 0.0f;
-  state.lastLocalLoss = 0.0f;
-  state.lastGlobalLoss = 0.0f;
-  state.alpha = kAlpha;
-  state.model = {0.0f, 0.0f, 0.0f};
-  state.m = {0.0f, 0.0f, 0.0f};
-  state.v = {0.0f, 0.0f, 0.0f};
-  state.sgdStepCount = 0;
-  state.hasPendingPrediction = false;
-  state.localModelRound = 0;
-  state.lastGlobalRound = 0;
-  state.lastDiscoveryMs = 0;
-  state.lastSampleMs = 0;
-  state.lastModelSyncMs = 0;
-  state.lastAggregationMs = 0;
-  state.lastWifiRetryMs = 0;
-
-  for (size_t index = 0; index < NeighborCount; ++index) {
-    state.neighbors[index].nodeId = kNeighborIds[index];
-    state.neighbors[index].temperatureC = kInitialTemperatureC;
-    state.neighbors[index].lastSeenMs = 0;
-    state.neighbors[index].valid = false;
-  }
-
-  for (size_t index = 0; index < kMaxRealtimePeers; ++index) {
-    state.livePeers[index].nodeId = 0;
-    state.livePeers[index].roleFlags = 0;
-    state.livePeers[index].temperatureC = kInitialTemperatureC;
-    state.livePeers[index].lastSeenMs = 0;
-    state.livePeers[index].hasTemperature = false;
-    state.livePeers[index].valid = false;
-  }
-
-  for (size_t index = 0; index < kMaxFederatedPeers; ++index) {
-    state.peerModels[index].nodeId = 0;
-    state.peerModels[index].model = {0.0f, 0.0f, 0.0f};
-    state.peerModels[index].weight = 0.0f;
-    state.peerModels[index].loss = 0.0f;
-    state.peerModels[index].round = 0;
-    state.peerModels[index].lastSeenMs = 0;
-    state.peerModels[index].valid = false;
-  }
-}
-
-void expireStaleData(NodeState& state, const uint32_t nowMs) {
-  for (size_t index = 0; index < NeighborCount; ++index) {
-    if (state.neighbors[index].valid &&
-        nowMs - state.neighbors[index].lastSeenMs > kNeighborTimeoutMs) {
-      state.neighbors[index].valid = false;
-    }
-  }
-
-  for (size_t index = 0; index < kMaxRealtimePeers; ++index) {
-    if (state.livePeers[index].valid && nowMs - state.livePeers[index].lastSeenMs > kRealtimePeerTimeoutMs) {
-      state.livePeers[index].valid = false;
-      state.livePeers[index].hasTemperature = false;
-    }
-  }
-
-  for (size_t index = 0; index < kMaxFederatedPeers; ++index) {
-    if (state.peerModels[index].valid &&
-        nowMs - state.peerModels[index].lastSeenMs > kPeerModelTimeoutMs) {
-      state.peerModels[index].valid = false;
-    }
-  }
-}
-
-void registerLivePeer(NodeState& state, const DiscoveryPacket& packet, const uint32_t nowMs) {
-  touchLivePeer(state, packet.nodeId, nowMs);
-
-  const size_t slot = findLivePeerSlot(state, packet.nodeId);
-  if (slot >= kMaxRealtimePeers) {
-    return;
-  }
-
-  state.livePeers[slot].roleFlags = packet.roleFlags;
-}
-
-void registerNeighborTemperature(NodeState& state, const uint8_t sourceNodeId, const float temperatureC,
-                                 const uint32_t nowMs) {
-  touchLivePeer(state, sourceNodeId, nowMs);
-
-  const size_t liveSlot = findLivePeerSlot(state, sourceNodeId);
-  if (liveSlot < kMaxRealtimePeers) {
-    state.livePeers[liveSlot].temperatureC = temperatureC;
-    state.livePeers[liveSlot].hasTemperature = true;
-  }
-
-  for (size_t index = 0; index < NeighborCount; ++index) {
-    if (state.neighbors[index].nodeId == 0) {
-      continue;
-    }
-    if (state.neighbors[index].nodeId != sourceNodeId) {
-      continue;
-    }
-
-    state.neighbors[index].temperatureC = temperatureC;
-    state.neighbors[index].lastSeenMs = nowMs;
-    state.neighbors[index].valid = true;
-    return;
-  }
-}
-
-void registerPeerModel(NodeState& state, const ModelPacket& packet, const uint32_t nowMs) {
-  touchLivePeer(state, packet.nodeId, nowMs);
-  const size_t slot = findPeerSlot(state, packet.nodeId);
-  if (slot >= kMaxFederatedPeers) {
-    return;
-  }
-
-  state.peerModels[slot].nodeId = packet.nodeId;
-  state.peerModels[slot].model = packet.model;
-  state.peerModels[slot].weight = packet.weight;
-  state.peerModels[slot].loss = packet.loss;
-  state.peerModels[slot].round = packet.round;
-  state.peerModels[slot].lastSeenMs = nowMs;
-  state.peerModels[slot].valid = true;
-}
-
-void applyGlobalModel(NodeState& state, const AggregationPacket& packet) {
-  state.model.w1 = (1.0f - kGlobalBlend) * state.model.w1 + kGlobalBlend * packet.model.w1;
-  state.model.w2 = (1.0f - kGlobalBlend) * state.model.w2 + kGlobalBlend * packet.model.w2;
-  state.model.b = (1.0f - kGlobalBlend) * state.model.b + kGlobalBlend * packet.model.b;
-  state.lastGlobalRound = packet.round;
-  state.lastGlobalLoss = packet.loss;
-  clampModel(state.model);
-}
-
-float evaluateCorrection(const ModelParameters& model, const float temperatureC) {
-  return evaluateQuadraticCorrection(model, temperatureC);
-}
-
-float computeLaplacian(const NodeState& state) {
-  return computeFiniteDifferenceLaplacian(buildStencil(state), kGridSpacing);
-}
-
-float computeAggregationWeight(const float laplacian) {
-  const float magnitude = fabsf(laplacian);
-  return magnitude > kMinimumAggregationWeight ? magnitude : kMinimumAggregationWeight;
-}
-
-float predictNextTemperature(const NodeState& state, float dtSeconds) {
-  return predictPhase2NodeStep(buildStencil(state), state.alpha, state.model, kGridSpacing,
-                               dtSeconds)
-      .predictedTempC;
-}
-
-void applyMeasurement(NodeState& state, const float measuredTemperatureC, const float dtSeconds) {
-  if (state.hasPendingPrediction) {
-    const Phase2TrainingUpdate grads =
-        computePhase2Gradients(measuredTemperatureC, state.pendingPredictionC,
-                               state.lastPredictionInputC);
-    state.lastPredictionError = grads.error;
-    state.lastLocalLoss = grads.error * grads.error;
-    
-    state.sgdStepCount++;
-    applyPhase2AdamUpdate(state.model, state.m, state.v, state.sgdStepCount, grads, kLearningRate);
-    clampPhase2Model(state.model, 32.0f, 32.0f, 32.0f);
-  } else {
-    state.lastPredictionError = 0.0f;
-    state.lastLocalLoss = 0.0f;
-  }
-
-  state.currentTempC = measuredTemperatureC;
-  state.lastPredictionInputC = state.currentTempC;
-
-  const Phase2Prediction prediction =
-      predictPhase2NodeStep(buildStencil(state), state.alpha, state.model, kGridSpacing,
-                            dtSeconds);
-  state.lastLaplacian = prediction.laplacian;
-  state.lastDiffusionTerm = prediction.diffusionTerm;
-  state.lastCorrectionTerm = prediction.correctionTerm;
-  state.pendingPredictionC = prediction.predictedTempC;
-  state.hasPendingPrediction = true;
-}
-
-bool buildAggregatedModel(const NodeState& state, AggregationPacket& packet) {
-  const float localWeight = computeAggregationWeight(state.lastLaplacian);
-  float weightedW1 = state.model.w1 * localWeight;
-  float weightedW2 = state.model.w2 * localWeight;
-  float weightedB = state.model.b * localWeight;
-  float weightedLoss = state.lastLocalLoss * localWeight;
-  float totalWeight = localWeight;
-
-  for (size_t index = 0; index < kMaxFederatedPeers; ++index) {
-    if (!state.peerModels[index].valid) {
-      continue;
-    }
-
-    const float peerWeight =
-        state.peerModels[index].weight > kMinimumAggregationWeight ? state.peerModels[index].weight
-                                                                   : kMinimumAggregationWeight;
-    weightedW1 += state.peerModels[index].model.w1 * peerWeight;
-    weightedW2 += state.peerModels[index].model.w2 * peerWeight;
-    weightedB += state.peerModels[index].model.b * peerWeight;
-    weightedLoss += state.peerModels[index].loss * peerWeight;
-    totalWeight += peerWeight;
-  }
-
-  if (totalWeight <= 0.0f) {
-    return false;
-  }
-
-  packet.nodeId = state.localNodeId;
-  packet.model.w1 = weightedW1 / totalWeight;
-  packet.model.w2 = weightedW2 / totalWeight;
-  packet.model.b = weightedB / totalWeight;
-  packet.round = state.lastGlobalRound + 1;
-  packet.loss = weightedLoss / totalWeight;
+  if (!slot) return false;
+  *slot={p.nodeId,p.model,p.sampleCount,p.meanLocalLoss,p.round,p.baseRound,p.baseLeaderId,
+         p.baseLeaderBootId,now,true};
+  touchPeer(s,p.nodeId,now);
   return true;
 }
-
-size_t countOnlinePeers(const NodeState& state) {
-  size_t count = 0;
-  for (size_t index = 0; index < kMaxRealtimePeers; ++index) {
-    if (state.livePeers[index].valid) {
-      ++count;
-    }
-  }
-  return count;
+uint8_t electedAggregatorId(const NodeState& s) {
+  if (!kAggregationEnabled || s.identityConflict) return 0;
+  if (kAggregatorNodeId) return kAggregatorNodeId;
+  uint8_t lowest=s.localNodeId;
+  for (const auto& p : s.livePeers) if (p.valid && p.bootId &&
+      (p.roleFlags & kRoleFlagAggregatorEligible) && p.nodeId < lowest) lowest=p.nodeId;
+  return lowest;
 }
-
-bool shouldBroadcastAggregation(const NodeState& state) {
-  if (!kAggregationEnabled) {
+bool shouldBroadcastAggregation(const NodeState& s) { return electedAggregatorId(s) == s.localNodeId; }
+bool applyGlobalModel(NodeState& s, const AggregationPacket& p) {
+  if (!p.nodeId || p.nodeId != electedAggregatorId(s) || !p.leaderBootId ||
+      p.leaderBootId != leaderBootId(s,p.nodeId) || !isValidModel(p.model) ||
+      !isfinite(p.meanLocalLoss) || p.meanLocalLoss < 0) return false;
+  const bool sameSession=s.hasGlobalModel && s.globalLeaderId == p.nodeId &&
+                         s.globalLeaderBootId == p.leaderBootId;
+  if (sameSession && !isNewerRound(p.round,s.lastGlobalRound)) return false;
+  s.model={(1-kGlobalBlend)*s.model.w1+kGlobalBlend*p.model.w1,
+           (1-kGlobalBlend)*s.model.w2+kGlobalBlend*p.model.w2,
+           (1-kGlobalBlend)*s.model.b+kGlobalBlend*p.model.b};
+  clampModel(s.model);
+  s.globalLeaderId=p.nodeId; s.globalLeaderBootId=p.leaderBootId;
+  s.lastGlobalRound=p.round; s.meanContributorLoss=p.meanLocalLoss; s.hasGlobalModel=true;
+  // Explicit optimizer policy: a new global base starts a fresh local Adam run.
+  s.m={0,0,0}; s.v={0,0,0}; s.adamStepCount=0;
+  s.localSampleCount=0; s.localLossSum=0;
+  for (auto& peer : s.peerModels) peer.valid=false;
+  return true;
+}
+float computeLaplacian(const NodeState& s) { return computeFiniteDifferenceLaplacian(buildStencil(s),kGridSpacing); }
+bool applyMeasurement(NodeState& s, float measured, float elapsedSeconds) {
+  if (s.identityConflict || !isValidTemperature(measured) || !isfinite(elapsedSeconds) || elapsedSeconds <= 0) {
+    s.hasPendingPrediction=false;
     return false;
   }
-
-  if (kAggregatorNodeId != 0) {
-    return state.localNodeId == kAggregatorNodeId;
-  }
-
-  uint8_t lowestNodeId = state.localNodeId;
-  for (size_t index = 0; index < kMaxRealtimePeers; ++index) {
-    if (!state.livePeers[index].valid) {
-      continue;
+  if (s.hasPendingPrediction) {
+    // Re-evaluate the cached input at current parameters and the measured elapsed
+    // interval. This avoids applying an old model's gradient after aggregation.
+    const auto prediction=predictPhase2NodeStep(s.pendingStencil,s.alpha,s.model,kGridSpacing,elapsedSeconds);
+    if (prediction.valid) {
+      const auto grads=computePhase2Gradients(measured,prediction);
+      if (applyPhase2AdamUpdate(s.model,s.m,s.v,s.adamStepCount+1,grads,kLearningRate)) {
+        ++s.adamStepCount;
+        clampModel(s.model);
+        s.lastPredictionError=grads.error; s.lastLocalLoss=grads.error*grads.error;
+        if (s.localSampleCount < 1000000u) { ++s.localSampleCount; s.localLossSum += s.lastLocalLoss; }
+      }
     }
-    if (state.livePeers[index].nodeId < lowestNodeId) {
-      lowestNodeId = state.livePeers[index].nodeId;
-    }
   }
-
-  return state.localNodeId == lowestNodeId;
+  s.currentTempC=measured;
+  s.pendingStencil=buildStencil(s);
+  const auto next=predictPhase2NodeStep(s.pendingStencil,s.alpha,s.model,kGridSpacing,kSamplePeriodMs/1000.0f);
+  s.lastLaplacian=computeLaplacian(s);
+  s.lastDiffusionTerm=next.diffusionTerm; s.lastCorrectionTerm=next.correctionTerm;
+  s.pendingPredictionC=next.valid ? next.predictedTempC : measured;
+  s.hasPendingPrediction=next.valid;
+  return true;
 }
-
+ModelPacket buildLocalModelPacket(const NodeState& s, uint16_t round) {
+  return {s.localNodeId,s.model,s.localSampleCount,
+          s.localSampleCount ? s.localLossSum/s.localSampleCount : 0,round,s.lastGlobalRound,
+          s.globalLeaderId,s.globalLeaderBootId,s.bootId};
+}
+bool buildAggregatedModel(const NodeState& s, AggregationPacket& p) {
+  if (!shouldBroadcastAggregation(s) || !isValidModel(s.model)) return false;
+  // Accumulate in double so counts cannot overflow and large counts lose less precision.
+  double total=s.localSampleCount;
+  double w1=s.model.w1*total, w2=s.model.w2*total, b=s.model.b*total, loss=s.localLossSum;
+  for (const auto& peer : s.peerModels) {
+    if (!peer.valid || !matchesBase(s,peer.baseLeaderId,peer.baseLeaderBootId,peer.baseRound)) continue;
+    const double weight=peer.sampleCount;
+    w1+=peer.model.w1*weight; w2+=peer.model.w2*weight; b+=peer.model.b*weight;
+    loss+=peer.meanLocalLoss*weight; total+=weight;
+  }
+  if (total <= 0) return false;
+  const uint16_t round=(s.globalLeaderId == s.localNodeId && s.globalLeaderBootId == s.bootId) ?
+      static_cast<uint16_t>(s.lastGlobalRound+1) : 1;
+  p={s.localNodeId,{static_cast<float>(w1/total),static_cast<float>(w2/total),static_cast<float>(b/total)},
+      static_cast<float>(loss/total),round,s.bootId};
+  return isValidModel(p.model) && isfinite(p.meanLocalLoss);
+}
+size_t countOnlinePeers(const NodeState& s) {
+  size_t count=0; for (const auto& p : s.livePeers) if (p.valid) ++count; return count;
+}
 }

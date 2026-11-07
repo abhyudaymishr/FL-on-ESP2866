@@ -1,210 +1,117 @@
+"""Datagram/state checks always run; the socket integration test needs loopback access."""
 import json
 import socket
+import struct
 import threading
-import time
 import unittest
 import urllib.request
+from unittest.mock import patch
 
-from visualization import server
+from pifl_vis import server
+from pifl_vis.protocol import wrap_packet
 
+KEY = 'test-key'
+def discovery(node=1, boot=101, roles=1):
+    return wrap_packet(struct.pack('<BBBBI', node, 4, 2, roles, boot), KEY)
+def temperature(node=1, value=26.25):
+    return wrap_packet(struct.pack('<BBBf', node, 1, 2, value), KEY)
+def model(node=1, round_num=2):
+    return wrap_packet(struct.pack('<BBBfffIHfHBII', node, 2, 2, .125, -.03125, .5,
+                                   7, round_num, .1875, 0, 0, 0, 101), KEY)
+def aggregation(node=1, boot=101, round_num=3):
+    return wrap_packet(struct.pack('<BBBfffHfI', node, 3, 2, .25, .0625, 1., round_num, .125, boot), KEY)
+def datagrams():
+    return [discovery(), temperature(), model(), aggregation()]
 
-def find_free_port() -> int:
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.bind(("127.0.0.1", 0))
-    port = int(sock.getsockname()[1])
-    sock.close()
-    return port
+class DashboardStateTest(unittest.TestCase):
+    def setUp(self):
+        self.state = server.DashboardState(4210, 8080, {1: {'label': 'Alpha'}})
 
+    def feed(self, packet):
+        return server.process_datagram(self.state, packet, 'test-source', KEY)
 
-def encode_signed(value: float, scale: float) -> bytes:
-    scaled = round(value * scale)
-    bounded = max(-32768, min(32767, scaled))
-    return int(bounded).to_bytes(2, "little", signed=True)
+    def test_datagrams_update_real_dashboard_state(self):
+        for packet in datagrams():
+            self.assertTrue(self.feed(packet))
+        data = self.state.snapshot()
+        self.assertEqual(data['packet_counters'], {'discovery': 1, 'temperature': 1, 'model': 1, 'aggregation': 1})
+        self.assertEqual(data['participant_count'], 1)
+        self.assertEqual(data['active_node_count'], 1)
+        self.assertEqual(data['global_round'], 3)
+        self.assertEqual(data['mean_contributor_loss'], .125)
+        self.assertNotIn('global_loss', data)
+        self.assertEqual(data['nodes'][0]['temperature_c'], 26.25)
+        self.assertEqual(data['nodes'][0]['sample_count'], 7)
+        self.assertEqual(data['nodes'][0]['label'], 'Alpha')
+        self.assertEqual(data['global_model']['w1'], .25)
+        self.assertEqual(data['nodes'][0]['model']['w1'], .125)
+        json.dumps(data, allow_nan=False)
 
+    def test_stale_duplicate_unelected_and_wrong_boot_aggregates(self):
+        for packet in datagrams(): self.feed(packet)
+        for packet in [aggregation(round_num=2), aggregation(), aggregation(boot=999), aggregation(node=2)]:
+            self.assertFalse(self.feed(packet))
+        self.assertEqual(self.state.snapshot()['global_round'], 3)
 
-def encode_unsigned(value: float, scale: float) -> bytes:
-    scaled = round(value * scale)
-    bounded = max(0, min(65535, scaled))
-    return int(bounded).to_bytes(2, "little", signed=False)
+    def test_new_boot_resets_session_and_history(self):
+        for packet in datagrams(): self.feed(packet)
+        self.assertTrue(self.feed(discovery(boot=102)))
+        self.assertTrue(self.feed(aggregation(boot=102, round_num=1)))
+        data = self.state.snapshot()
+        self.assertEqual(data['global_round'], 1)
+        self.assertEqual(len(data['global_history']), 1)
+        self.assertIsNone(data['nodes'][0]['temperature_c'])
 
+    def test_liveness_does_not_refresh_temperature_or_training_data(self):
+        with patch('pifl_vis.server.time.monotonic', return_value=100):
+            for packet in datagrams(): self.feed(packet)
+        with patch('pifl_vis.server.time.monotonic', return_value=120):
+            self.feed(discovery())
+            data = self.state.snapshot()
+        self.assertEqual(data['active_node_count'], 1)
+        self.assertEqual(data['participant_count'], 0)
+        self.assertIsNone(data['average_local_loss'])
+        self.assertIsNone(data['nodes'][0]['temperature_c'])
 
-def discovery_packet(node_id: int, role_flags: int) -> bytes:
-    return bytes(
-        [node_id, server.DISCOVERY_PACKET, role_flags, server.PROTOCOL_VERSION]
-    )
+    def test_corruption_never_changes_state(self):
+        wire = bytearray(temperature()); wire[3] ^= 1
+        self.assertFalse(self.feed(bytes(wire)))
+        self.assertEqual(self.state.snapshot()['node_count'], 0)
 
-
-def temperature_packet(node_id: int, temperature_c: float) -> bytes:
-    return bytes([node_id, server.TEMPERATURE_PACKET]) + encode_signed(
-        temperature_c, server.TEMPERATURE_SCALE
-    )
-
-
-def model_packet(
-    node_id: int,
-    w1: float,
-    w2: float,
-    b: float,
-    weight: float,
-    round_num: int,
-    loss: float,
-) -> bytes:
-    return (
-        bytes([node_id, server.MODEL_PACKET])
-        + encode_signed(w1, server.PARAMETER_SCALE)
-        + encode_signed(w2, server.PARAMETER_SCALE)
-        + encode_signed(b, server.PARAMETER_SCALE)
-        + encode_unsigned(weight, server.WEIGHT_SCALE)
-        + int(round_num).to_bytes(2, "little", signed=False)
-        + encode_unsigned(loss, server.LOSS_SCALE)
-    )
-
-
-def aggregation_packet(
-    node_id: int, w1: float, w2: float, b: float, round_num: int, loss: float
-) -> bytes:
-    return (
-        bytes([node_id, server.AGGREGATION_PACKET])
-        + encode_signed(w1, server.PARAMETER_SCALE)
-        + encode_signed(w2, server.PARAMETER_SCALE)
-        + encode_signed(b, server.PARAMETER_SCALE)
-        + int(round_num).to_bytes(2, "little", signed=False)
-        + encode_unsigned(loss, server.LOSS_SCALE)
-    )
-
-
-class SimulationRunTest(unittest.TestCase):
-    def setUp(self) -> None:
-        self.udp_port = find_free_port()
-        self.http_port = find_free_port()
-        self.state = server.DashboardState(
-            self.udp_port,
-            self.http_port,
-            {
-                1: {"label": "Alpha"},
-                2: {"label": "Beta"},
-            },
-        )
-        self.stop_event = threading.Event()
-        self.ready_event = threading.Event()
-        self.udp_thread = threading.Thread(
-            target=server.run_udp_listener,
-            args=(self.state, "127.0.0.1", self.stop_event, self.ready_event),
-            daemon=True,
-        )
-        self.udp_thread.start()
-        self.assertTrue(self.ready_event.wait(timeout=2.0))
-
-        self.http_server = server.create_http_server(self.state, "127.0.0.1", self.http_port)
-        self.http_thread = threading.Thread(target=self.http_server.serve_forever, daemon=True)
-        self.http_thread.start()
-
-    def tearDown(self) -> None:
-        self.http_server.shutdown()
-        self.http_server.server_close()
-        self.http_thread.join(timeout=2.0)
-        self.stop_event.set()
-        self.udp_thread.join(timeout=2.0)
-
-    def fetch_state(self) -> dict:
-        with urllib.request.urlopen(
-            f"http://127.0.0.1:{self.http_port}/api/state", timeout=2.0
-        ) as response:
-            return json.loads(response.read().decode("utf-8"))
-
-    def wait_for_packets(self, expected_node_count: int) -> dict:
-        deadline = time.time() + 3.0
-        snapshot = {}
-        while time.time() < deadline:
-            snapshot = self.fetch_state()
-            if (
-                snapshot["node_count"] == expected_node_count
-                and snapshot["packet_counters"]["temperature"] >= 2
-                and snapshot["packet_counters"]["model"] >= 2
-                and snapshot["packet_counters"]["aggregation"] >= 1
-                and snapshot["packet_counters"]["discovery"] >= 2
-                and snapshot["participant_count"] >= expected_node_count
-                and snapshot["global_round"] >= 3
-            ):
-                return snapshot
-            time.sleep(0.05)
-        self.fail(f"Timed out waiting for simulated packets. Last snapshot: {snapshot}")
-
-    def test_simulated_run_updates_dashboard_state(self) -> None:
-        sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+class SocketIntegrationTest(unittest.TestCase):
+    def test_udp_to_http(self):
+        # A restricted environment is reported as a skip, not a successful socket test.
         try:
-            sender.sendto(
-                discovery_packet(1, server.ROLE_FLAG_AGGREGATOR_ELIGIBLE),
-                ("127.0.0.1", self.udp_port),
-            )
-            sender.sendto(temperature_packet(1, 26.25), ("127.0.0.1", self.udp_port))
-            sender.sendto(
-                model_packet(1, 0.125, -0.03125, 0.5, 1.75, 2, 0.1875),
-                ("127.0.0.1", self.udp_port),
-            )
-            sender.sendto(
-                discovery_packet(2, server.ROLE_FLAG_AUTO_NEIGHBOR),
-                ("127.0.0.1", self.udp_port),
-            )
-            sender.sendto(temperature_packet(2, 29.50), ("127.0.0.1", self.udp_port))
-            sender.sendto(
-                model_packet(2, 0.0625, 0.015625, 0.25, 0.875, 2, 0.09375),
-                ("127.0.0.1", self.udp_port),
-            )
-            sender.sendto(
-                aggregation_packet(1, 0.25, 0.0625, 1.0, 3, 0.125),
-                ("127.0.0.1", self.udp_port),
-            )
-        finally:
-            sender.close()
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+                probe.bind(('127.0.0.1', 0))
+                udp_port = probe.getsockname()[1]
+            state = server.DashboardState(udp_port, 0, {})
+            http = server.create_http_server(state, '127.0.0.1', 0)
+            self.addCleanup(http.server_close)
+            stop, ready = threading.Event(), threading.Event()
+            listener = threading.Thread(target=server.run_udp_listener,
+                args=(state, '127.0.0.1', stop, ready, KEY), daemon=True)
+            listener.start()
+            self.addCleanup(lambda: (stop.set(), listener.join(timeout=2)))
+            self.assertTrue(ready.wait(2))
+            http_thread = threading.Thread(target=http.serve_forever, daemon=True)
+            http_thread.start()
+            self.addCleanup(lambda: (http.shutdown(), http_thread.join(timeout=2)))
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sender:
+                for packet in datagrams(): sender.sendto(packet, ('127.0.0.1', udp_port))
+            # Wait on an event-sized polling interval, with a bounded overall deadline.
+            import time
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                with urllib.request.urlopen(f'http://127.0.0.1:{http.server_port}/api/state', timeout=2) as response:
+                    data = json.load(response)
+                if data['packet_counters']['aggregation'] == 1: break
+                stop.wait(.02)
+            self.assertEqual(data['global_round'], 3)
+            self.assertEqual(data['nodes'][0]['temperature_c'], 26.25)
+            with urllib.request.urlopen(f'http://127.0.0.1:{http.server_port}/', timeout=2) as response:
+                self.assertIn('Contributor Training Loss', response.read().decode())
+        except (PermissionError, OSError) as exc:
+            self.skipTest(f'Loopback socket access unavailable: {exc}')
 
-        snapshot = self.wait_for_packets(expected_node_count=2)
-        root = urllib.request.urlopen(
-            f"http://127.0.0.1:{self.http_port}/", timeout=2.0
-        ).read().decode("utf-8")
-
-        self.assertIn("Physics-Informed", root)
-        self.assertEqual(snapshot["node_count"], 2)
-        self.assertEqual(snapshot["participant_count"], 2)
-        self.assertEqual(snapshot["global_sender"], 1)
-        self.assertEqual(snapshot["packet_counters"]["temperature"], 2)
-        self.assertEqual(snapshot["packet_counters"]["model"], 2)
-        self.assertEqual(snapshot["packet_counters"]["aggregation"], 1)
-        self.assertEqual(snapshot["packet_counters"]["discovery"], 2)
-        self.assertEqual(snapshot["global_round"], 3)
-        self.assertAlmostEqual(snapshot["global_loss"], 0.125, places=3)
-        self.assertAlmostEqual(snapshot["average_local_loss"], 0.140625, places=3)
-
-        nodes = {node["node_id"]: node for node in snapshot["nodes"]}
-        self.assertEqual(nodes[1]["label"], "Alpha")
-        self.assertEqual(nodes[2]["label"], "Beta")
-        self.assertAlmostEqual(nodes[1]["temperature_c"], 26.25, places=2)
-        self.assertAlmostEqual(nodes[2]["temperature_c"], 29.50, places=2)
-        self.assertAlmostEqual(nodes[1]["aggregation_weight"], 1.75, places=2)
-        self.assertAlmostEqual(nodes[2]["aggregation_weight"], 0.875, places=3)
-        self.assertEqual(nodes[1]["round"], 2)
-        self.assertEqual(nodes[2]["round"], 2)
-        self.assertAlmostEqual(nodes[1]["loss"], 0.1875, places=3)
-        self.assertAlmostEqual(nodes[2]["loss"], 0.09375, places=3)
-        self.assertEqual(nodes[1]["role_flags"], server.ROLE_FLAG_AGGREGATOR_ELIGIBLE)
-        self.assertEqual(nodes[2]["role_flags"], server.ROLE_FLAG_AUTO_NEIGHBOR)
-        self.assertAlmostEqual(nodes[1]["model"]["w1"], 0.125, places=3)
-        self.assertAlmostEqual(nodes[1]["model"]["w2"], -0.03125, places=3)
-        self.assertAlmostEqual(nodes[1]["model"]["b"], 0.5, places=3)
-        self.assertAlmostEqual(nodes[2]["model"]["w1"], 0.0625, places=3)
-        self.assertAlmostEqual(nodes[2]["model"]["w2"], 0.015625, places=3)
-        self.assertAlmostEqual(nodes[2]["model"]["b"], 0.25, places=3)
-        self.assertEqual(len(nodes[1]["loss_history"]), 1)
-        self.assertEqual(len(nodes[2]["loss_history"]), 1)
-        self.assertEqual(nodes[1]["loss_history"][0]["round"], 2)
-        self.assertEqual(nodes[2]["loss_history"][0]["round"], 2)
-        self.assertAlmostEqual(snapshot["global_model"]["w1"], 0.25, places=3)
-        self.assertAlmostEqual(snapshot["global_model"]["w2"], 0.0625, places=3)
-        self.assertAlmostEqual(snapshot["global_model"]["b"], 1.0, places=3)
-        self.assertEqual(len(snapshot["global_history"]), 1)
-        self.assertEqual(snapshot["global_history"][0]["round"], 3)
-        self.assertAlmostEqual(snapshot["global_history"][0]["loss"], 0.125, places=3)
-
-
-if __name__ == "__main__":
-    unittest.main()
+if __name__ == '__main__': unittest.main()

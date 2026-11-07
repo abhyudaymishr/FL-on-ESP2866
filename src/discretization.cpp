@@ -3,7 +3,13 @@
 namespace pifl {
 
 float computeFiniteDifferenceLaplacian(const FiniteDifferenceStencil& stencil, const float gridSpacing) {
-  return (stencil.northTempC + stencil.southTempC + stencil.eastTempC + stencil.westTempC -
+  const float neighbors[] = {stencil.northTempC, stencil.southTempC,
+                             stencil.eastTempC, stencil.westTempC};
+  float sum = 0.0f;
+  for (unsigned i = 0; i < 4; ++i) {
+    sum += (stencil.zeroFluxMask & (1u << i)) ? stencil.centerTempC : neighbors[i];
+  }
+  return (sum -
           4.0f * stencil.centerTempC) /
          (gridSpacing * gridSpacing);
 }
