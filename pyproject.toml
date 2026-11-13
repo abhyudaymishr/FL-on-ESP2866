@@ -20,6 +20,7 @@ dependencies = []
 
 [project.scripts]
 pifl-dashboard = "pifl_vis.server:main"
+pifl-bridge = "pifl_vis.bridge:main"
 
 [tool.setuptools]
 packages = ["pifl_vis"]

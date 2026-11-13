@@ -1,0 +1,30 @@
+name: Roll back Cloudflare code
+on:
+  workflow_dispatch:
+    inputs:
+      version_id:
+        description: Existing Worker version UUID to restore (database is retained)
+        required: true
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: pifl-PIFL CI and Cloudflare deployment-refs/heads/main
+  cancel-in-progress: false
+jobs:
+  rollback:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    environment: production
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+      - run: node scripts/rollback.mjs
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          PIFL_WORKER_NAME: ${{ vars.PIFL_WORKER_NAME || 'fl-on-esp2866' }}
+          PIFL_ROLLBACK_VERSION: ${{ inputs.version_id }}

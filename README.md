@@ -1,6 +1,25 @@
 # Physics-Informed Federated Learning on ESP8266
 
-This repository contains a minimal viable firmware implementation of a physics-informed federated thermal node for ESP8266.
+Physics-informed federated thermal learning on ESP8266, with a separate Cloudflare control plane, a responsive monitoring console, and a GitHub Actions release pipeline.
+
+## Control plane and CI/CD
+
+The new console separates domain rules, API access, application state, and rendering. It includes live gateway monitoring, explicitly labeled simulation, node filtering and inspection, temperature/loss history, snapshot export, dark theme, and a read-only telemetry guide.
+
+The cloud design uses **Workers + Static Assets + D1**, with one LAN gateway and up to 12 boards. The boards keep training and aggregating locally. The gateway forwards authenticated HTTPS snapshots every 30 seconds; D1 stores a latest snapshot and a bounded 24-hour history ring.
+
+```sh
+npm ci --ignore-scripts
+npm run dev
+```
+
+Open [http://127.0.0.1:3000](http://127.0.0.1:3000) and select **Explore simulation**. The local preview does not emulate Cloudflare services. Use the deployed Worker URL for authenticated physical gateway data.
+
+- [Architecture, data structures, tradeoffs and free-tier budget](docs/architecture.md)
+- [Deployment, GitHub secrets, LAN bridge and rollback](docs/deployment.md)
+- [CI/CD workflow](.github/workflows/ci-cd.yml)
+
+Pull requests run native/Python/protocol tests, cloud SQL/API/domain tests, a pinned ESP8266 build, and release packaging. Configure the connected Cloudflare Workers Build with `npm run ci:cloudflare` and `npm run release:cloudflare` to validate and deploy `fl-on-esp2866` from `main`, followed by authenticated smoke checks. GitHub Actions deployment is an optional alternative enabled by `PIFL_DEPLOY_PROVIDER=github-actions`. Firmware binaries are built as artifacts; boards are flashed separately.
 
 ## What the MVP does
 
@@ -13,7 +32,7 @@ This repository contains a minimal viable firmware implementation of a physics-i
 - Broadcasts:
   - local temperature packets for PDE coupling
   - model packets for federated learning
-- Aggregates peer models with Laplacian-magnitude weighting on the designated aggregator node.
+- Aggregates peer models with sample-weighted FedAvg on the designated or elected aggregator node.
 
 ## Project layout
 
@@ -30,6 +49,12 @@ This repository contains a minimal viable firmware implementation of a physics-i
 - `dashboard/`: Node.js and browser-based real-time dashboard with charts.
 - `experiments/`: thermal benchmarking harness (`thermal_benchmark.cpp` / `run_benchmark.py`).
 - `ppt/generator.py`: self-contained PowerPoint deck generator for the project overview.
+- `console/`: responsive browser console, data adapter, state store, and presentation components.
+- `shared/domain.mjs`: framework-independent schema, freshness, summary, and guide logic.
+- `cloud/`: Workers API, D1 repository, and numbered schema migrations.
+- `pifl_vis/bridge.py`: bounded UDP-to-HTTPS LAN gateway.
+- `scripts/`: dependency-free packaging, deployment, smoke verification, and rollback.
+- `.github/workflows/`: CI/CD and manual code rollback.
 
 ## Configuration
 
@@ -93,7 +118,7 @@ The dashboard shows:
 Start it from the project root:
 
 ```bash
-python3 pifl_vis/server.py --http-port 8080 --udp-port 4210
+python3 -m pifl_vis.server --http-port 8080 --udp-port 4210
 ```
 
 Then open [http://127.0.0.1:8080](http://127.0.0.1:8080).
@@ -142,12 +167,14 @@ All packets are framed with a 3-byte header and a 4-byte FNV-1a integrity checks
 | NodeID (1B) | Type (1B) | Version (1B) | Payload (variable) | Checksum (4B) |
 ```
 
-Packet types:
+Packet lengths include the 3-byte header and, in the final column, the 4-byte checksum:
 
-- `0x01` (Temperature, 7B payload): `floatLE temperatureC`.
-- `0x02` (ModelUpdate, 36B payload): `floatLE w1, w2, b`, `uint32LE sampleCount`, `uint16LE round`, `floatLE meanLocalLoss`, `uint16LE baseRound`, `uint8_t baseLeaderId`, `uint32LE baseLeaderBootId`, `uint32LE senderBootId`.
-- `0x03` (GlobalAggregation, 25B payload): `floatLE w1, w2, b`, `uint16LE round`, `floatLE meanContributorLoss`, `uint32LE leaderBootId`.
-- `0x04` (Discovery, 8B payload): `uint8_t roleFlags`, `uint32LE bootId`.
+| Type | Body fields | Header + body | Full wire |
+| --- | --- | --- | --- |
+| `0x01` Temperature | `floatLE temperatureC` | 7 B | 11 B |
+| `0x02` ModelUpdate | `floatLE w1,w2,b`, `uint32LE sampleCount`, `uint16LE round`, `floatLE meanLocalLoss`, `uint16LE baseRound`, `uint8 baseLeaderId`, `uint32LE baseLeaderBootId,senderBootId` | 36 B | 40 B |
+| `0x03` GlobalAggregation | `floatLE w1,w2,b`, `uint16LE round`, `floatLE meanContributorLoss`, `uint32LE leaderBootId` | 25 B | 29 B |
+| `0x04` Discovery | `uint8 roleFlags`, `uint32LE bootId` | 8 B | 12 B |
 
 ## Main control loop
 
@@ -164,6 +191,6 @@ Each sample step performs:
 
 ## Notes
 
-- The transport is UDP broadcast over WiFi, with support for MQTT fallback.
+- Firmware supports UDP broadcast over WiFi or configured MQTT mode. The cloud LAN bridge currently receives UDP.
 - Missing neighbors fall back to the local temperature, equivalent to a zero-flux Neumann boundary condition.
 - The sensor layer supports synthetic simulation as well as analog and DS18B20 1-Wire sensors in [`src/sensor.cpp`](src/sensor.cpp).

@@ -1,0 +1,17 @@
+{
+  "name": "pifl-control-plane",
+  "version": "2.0.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=22.18" },
+  "scripts": {
+    "dev": "node scripts/dev.mjs",
+    "build": "node scripts/build.mjs",
+    "test": "node --test tests/cloud/*.test.mjs",
+    "check": "node scripts/check.mjs",
+    "deploy": "node scripts/deploy.mjs",
+    "ci:cloudflare": "node scripts/ci-cloudflare.mjs",
+    "release:cloudflare": "node scripts/release-cloudflare.mjs",
+    "smoke": "node scripts/smoke.mjs"
+  }
+}
