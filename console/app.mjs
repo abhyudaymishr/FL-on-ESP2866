@@ -2,6 +2,7 @@ import {TelemetryClient} from './data/client.mjs';
 import {demoSnapshot,demoHistory} from './data/demo.mjs';
 import {createStore} from './state/store.mjs';
 import {render,nodeDetails} from './ui/render.mjs';
+import {createOnboarding} from './ui/onboarding.mjs';
 import {diagnose,LIMITS} from '../shared/domain.mjs';
 const store=createStore(), $=id=>document.getElementById(id);
 let timer=null,controller=null,historyLoadedAt=0,client=new TelemetryClient();
@@ -38,7 +39,8 @@ $('connection-form').addEventListener('submit',event=>{
   $('connection-dialog').close();refresh();
 });
 $('disconnect').addEventListener('click',()=>{stop();client.token='';storage.set('pifl-read-token',null);store.set({mode:'disconnected',snapshot:null,receivedAt:null,points:[],error:null});$('connection-dialog').close();});
-$('demo').addEventListener('click',()=>{stop();historyLoadedAt=0;store.set({mode:'demo',snapshot:null,receivedAt:null,points:demoHistory(),error:null,paused:false});refresh();});
+function startDemo(){stop();historyLoadedAt=0;store.set({mode:'demo',snapshot:null,receivedAt:null,points:demoHistory(),error:null,paused:false});refresh();}
+$('demo').addEventListener('click',startDemo);
 $('pause').addEventListener('click',()=>{const paused=!store.get().paused;store.set({paused});paused?stop():refresh();});
 for(const [id,key] of [['search','filter'],['node-status','status'],['node-sort','sort']])$(id).addEventListener(id==='search'?'input':'change',event=>store.set({[key]:event.target.value}));
 for(const select of document.querySelectorAll('.range-select'))select.addEventListener('change',event=>{
@@ -80,3 +82,10 @@ setInterval(()=>{const now=Date.now();$('clock').textContent=new Date(now).toLoc
   if(store.get().mode!=='demo'&&!document.hidden)render(store.get(),now);
 },5000);
 const token=storage.get('pifl-read-token');if(token){client.token=token;store.set({mode:'live'});refresh();}else render(store.get());
+const onboarding=createOnboarding({
+  navigate(view){history.replaceState(null,'',`#${view}`);route();},
+  restore(hash){history.replaceState(null,'',hash||location.pathname+location.search);route();},
+  startDemo,openConnection,
+  connectionTarget:()=>store.get().mode==='live'&&store.get().snapshot?'mode-label':'connection-banner'
+});
+onboarding.showOnFirstVisit();

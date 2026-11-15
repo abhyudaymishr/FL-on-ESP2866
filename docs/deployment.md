@@ -84,6 +84,8 @@ The bridge receives UDP, checks wire validity and model sender boot identity, an
 
 Open the cloud console, select **Connect**, and enter the read token. The gateway upload token cannot read the dashboard; the read token cannot ingest telemetry. An empty authorized dashboard means no capture has arrived yet. A stale gateway is different from offline boards at the latest capture. Use **Ask the guide** for explanations, not hardware commands.
 
+First-time visitors see a six-step dashboard tour covering connection, metrics, chart history, node inspection, and learning. It offers direct access to simulation or connection settings and can be skipped or closed with Escape. Completing or dismissing it is remembered in this browser; the **?** button in the top bar always reopens it. Only the tour preference is saved persistently; read tokens retain their existing tab-session storage. If browser storage is blocked, the tour still works but may appear again after a reload.
+
 ## Rollback and recovery
 
 In GitHub Actions, run **Roll back Cloudflare code** on `main` with an existing Worker version UUID from the Cloudflare dashboard. This restores code and its versioned assets; it retains D1. Keep migrations additive. If a release rotates tokens, verify the intended token state after rollback.
@@ -99,5 +101,6 @@ Before treating the interface as visually approved, run the unrestricted local p
 - Search, status filter, sort, node inspector, time-range selection, pause/resume, JSON export.
 - Separate sensor/model freshness, stale gateway, rejected read token, failed network request.
 - Guide answers for health, leaders, loss, physics, and request budget.
+- First-visit tour, back/next/finish, skip/Escape, replay with **?**, remembered dismissal after reload, and simulation/connection shortcuts. Verify tour layout at mobile widths and with browser storage blocked.
 
 The implementation is responsive, but this session's browser security policy prevented visual verification. Automated SQL/API checks do not replace this acceptance pass.
